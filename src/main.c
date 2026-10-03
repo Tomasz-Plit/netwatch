@@ -12,17 +12,22 @@ int main(void){
     address.sll_family = AF_PACKET;
     address.sll_protocol = htons(ETH_P_ALL);
     address.sll_ifindex = if_nametoindex("wlp0s20f3:");
-    int output = bind(
+    int binder = bind(
         sockfd,
         (struct sockaddr *) &address,
         sizeof(address)
     );
-    if (sockfd == -1){
-        perror("socket");
+    unsigned char buffer[2048];
+    ssize_t rec = recvfrom(
+        sockfd, buffer, 2048, 0, NULL, NULL
+    );
+    if(rec == -1){
+        perror("recvfrom");
     }
-    if (output == -1){
-        perror("bind");
+    printf("sockfd = %d\n", sockfd);
+    printf("%zd\n", rec);
+    for(int i = 0; i < rec; i++){
+        printf("%02x ", buffer[i]);
     }
-    printf("%d", output);
     return 0;
 }
