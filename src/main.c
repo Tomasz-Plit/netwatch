@@ -1,3 +1,4 @@
+#include <math.h>
 #include <netinet/in.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -112,7 +113,17 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
             fprintf(f, "\n");
         }
     }
-    else fprintf(f, "Not a TCP connection\n\n");
+    else if(proto == 17){
+        if(total < ihl + 8 || 14 + ihl + 8 > (size_t)rec) return;
+
+        uint16_t sport = rd16(l4);
+        uint16_t dport = rd16(l4+ 2);
+        uint16_t udp_len = rd16(l4 + 4);
+        uint16_t udp_ck = rd16(l4 + 6);
+
+        fprintf(f, "UDP Header: \n\t Src port: %u\n\t Dst port: %u\n\t Length: %u\n\t Checksum: 0x%04x\n",
+        sport, dport, udp_len, udp_ck);
+    }
 
 
 
