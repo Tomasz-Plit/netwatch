@@ -13,6 +13,8 @@
 #include <net/if.h>
 #include <sys/types.h>
 
+#define MAX_DUMP 256
+
 static uint16_t rd16(const unsigned char *p){ return (p[0] << 8) | p[1]; }
 static uint32_t rd32(const unsigned char *p){
     return ((uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | (uint32_t)p[3]);
@@ -42,6 +44,27 @@ ssize_t recieve_packet(int sockfd, unsigned char *buf, size_t size){
     if(rec == -1) {perror("recvfrom");}
     return rec;
 }
+
+static void print_payload(FILE *f, const unsigned char *p, size_t len){
+    size_t shown = len > MAX_DUMP ? MAX_DUMP : len;
+
+    for(size_t off = 0; off < shown; off += 16){
+        fprintf(f, "\t%04zx ", off);
+        
+        for(size_t i = 0; i < 16; i++){
+            if(off + i < shown) fprintf(f, "%02x ", p[off + i]);
+            else                fprintf(f, "    ");
+        }
+
+        fprintf(f, "\n");
+        for(size_t i = 0; i < 16 && off + i < shown; i++){
+            unsigned char c = p[off + i];
+            fputc((c >= 32 && c < 127) ? c : '.', f);
+        }
+    }
+    if(len > shown) fprintf(f, "\t... %zu more bytes not shown \n", len - shown);
+}
+
 
 void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
     if(rec < 14) return;
@@ -76,7 +99,8 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
     const unsigned char *l4 = ip + ihl;
     size_t l4_len = total - ihl;
     size_t hdr = 0;
-    
+    const unsigned char *payload = NULL;
+    size_t payload_len = 0;
     if(proto == 6){
         hdr = (l4[12] >> 4) * 4;
         if(total < ihl + 20 || ihl + 14 + 20 > rec) return;
@@ -123,9 +147,16 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
 
         fprintf(f, "UDP Header: \n\t Src port: %u\n\t Dst port: %u\n\t Length: %u\n\t Checksum: 0x%04x\n",
         sport, dport, udp_len, udp_ck);
+        hdr = 8;
     }
-
-
+    payload = l4 + hdr;
+    payload_len = total - ihl - hdr;
+    size_t avail = (size_t)rec - 14 - ihl - hdr;
+    if(payload_len > avail) payload_len = avail;
+    fprintf(f, "Message (%zu bytes):\n", payload_len);
+    if(payload_len > 0){
+        print_payload(f, payload, payload_len);
+    }
 
     fprintf(f, "\n ---------------------------------------------\n");
     return;
