@@ -26,12 +26,7 @@ int open_raw_socket(const char *ifname){
     address.sll_family = AF_PACKET;
     address.sll_protocol = htons(ETH_P_ALL);
     address.sll_ifindex = if_nametoindex(ifname);
-    if (address.sll_ifindex == 0) { perror("if_nametoindex"); return -1; }
-    int binder = bind(
-        sockfd,
-        (struct sockaddr *) &address,
-        sizeof(address)
-    );    
+    if (address.sll_ifindex == 0) { perror("if_nametoindex"); return -1; }  
     if (bind(sockfd, (struct sockaddr *)&address, sizeof address) == -1) {
         perror("bind");
         return -1;
@@ -76,6 +71,50 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
     fprintf(f, "\tDst IP: %u.%u.%u.%u \n", ip[16], ip[17], ip[18], ip[19]);
     fprintf(f, "\tFlags: DF:%d MF %d\n", df, mf);
     fprintf(f, "\tFragment offset %u (%u bytes)\n\n", frag_of, frag_of * 8);
+    //------------ End of ip -----------
+    const unsigned char *l4 = ip + ihl;
+    size_t l4_len = total - ihl;
+    size_t hdr = 0;
+    
+    if(proto == 6){
+        hdr = (l4[12] >> 4) * 4;
+        if(total < ihl + 20 || ihl + 14 + 20 > rec) return;
+        if(hdr < 20 || ihl + hdr > total || 14 + ihl + hdr > rec) return;
+
+        uint16_t sport = rd16(l4);
+        uint16_t dport = rd16(l4 + 2);
+        uint32_t seq = rd32(l4+4);
+        uint32_t ack = rd32(l4 + 8);
+        uint8_t fl = l4[13];
+        uint16_t window = rd16(l4 + 14);
+        uint16_t tcp_ck = rd16(l4 + 16);
+        uint16_t urgent = rd16(l4+18);
+        fprintf(f, "TCP Header:\n\t Src port: %u\n\t Dst port: %u\n", sport, dport);
+        fprintf(f, "\t Sequence number: %u\n\t Acknowledgement number: %u\n\t Header length: %zu bytes\n",
+        seq, ack, hdr);
+        fprintf(f, "\t Flags: 0x%02x [%s%s%s%s%s%s%s]\n", fl,
+            (fl & 0x80) ? "CWR " : "",
+            (fl & 0x40) ? "ECE " : "",
+            (fl & 0x20) ? "URG " : "",
+            (fl & 0x10) ? "ACK " : "",
+            (fl & 0x08) ? "PSH " : "",
+            (fl & 0x04) ? "RST " : "",
+            (fl & 0x02) ? "SYN " : "",
+            (fl & 0x01) ? "FIN " : "");
+        fprintf(f, "\t Window ize: %u\n\t Checksum: 0x%04x\n\t Urgent pointer: %u\n",
+            window, tcp_ck, urgent);
+        
+        if(hdr > 20){
+            fprintf(f, "\tOptions (%zu bytes): ", hdr - 20);
+            for(size_t i = 20; i < hdr; i++){
+                fprintf(f, "%02x", l4[i]);
+            }
+            fprintf(f, "\n");
+        }
+    }
+    else fprintf(f, "Not a TCP connection\n\n");
+
+
 
     fprintf(f, "\n ---------------------------------------------\n");
     return;
