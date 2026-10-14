@@ -65,15 +65,61 @@ static void print_payload(FILE *f, const unsigned char *p, size_t len){
     if(len > shown) fprintf(f, "\t... %zu more bytes not shown \n", len - shown);
 }
 
+static int extract_sni(const unsigned char *p, size_t len, char *out, size_t outsz) {
+    if (len < 9 || p[0] != 0x16 || p[1] != 0x03) return 0;  // TLS handshake record
+    size_t i = 5;                                           // skip record header
+    if (p[i] != 0x01) return 0;                             // must be ClientHello
+    i += 4;                                                 // handshake header
+    i += 2 + 32;                                            // version + random
 
-void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
-    if(rec < 14) return;
+    if (i + 1 > len) return 0;
+    i += 1 + p[i];                                          // session ID
+
+    if (i + 2 > len) return 0;
+    i += 2 + rd16(p + i);                                   // cipher suites
+
+    if (i + 1 > len) return 0;
+    i += 1 + p[i];                                          // compression methods
+
+    if (i + 2 > len) return 0;
+    size_t end = i + 2 + rd16(p + i);                       // end of extensions
+    i += 2;
+    if (end > len) end = len;                               // ClientHello may be cut off
+
+    while (i + 4 <= end) {
+        uint16_t type = rd16(p + i);
+        uint16_t elen = rd16(p + i + 2);
+        i += 4;
+        if (i + elen > end) return 0;
+
+        if (type == 0x0000) {                               // server_name
+            if (elen < 5) return 0;
+            uint16_t nlen = rd16(p + i + 3);                // skip list len (2) + name type (1)
+            if (5 + nlen > elen || nlen >= outsz) return 0;
+            for (uint16_t k = 0; k < nlen; k++) {           // hostname must be printable
+                unsigned char c = p[i + 5 + k];
+                if (c <= 32 || c >= 127) return 0;
+            }
+            memcpy(out, p + i + 5, nlen);
+            out[nlen] = '\0';
+            return 1;
+        }
+        i += elen;                                          // next extension
+    }
+    return 0;
+}
+
+static void print_macs(FILE *f, const unsigned char *buf){
     fprintf(f, "Source MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
         buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]);
     fprintf(f, "Destination MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
         buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
-    
-    if(rd16(buf + 12) != 0x0800) {fprintf(f, "not an IPv4 \n\n"); return;}
+ 
+}
+
+void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
+    if(rec < 14) return;
+    if(rd16(buf + 12) != 0x0800) {print_macs(f, buf); fprintf(f, "not an IPv4 \n\n"); return;}
     if(rec < 14 + 20) return;
     
     const unsigned char *ip = buf + 14;
@@ -86,7 +132,16 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
     int df = (flags >> 14) & 1;
     int mf = (flags >> 13) & 1;
     uint16_t frag_of = flags & 0x1FFF;
+    const unsigned char *l4 = ip + ihl;
+    // silent filter, ACK provide no vale so we silent them
+    if(proto == 6 && frag_of == 0){
+        if(total < ihl + 20 || (size_t)rec < 14 + ihl + 20) return;
+        size_t thdr = (l4[12] >> 4) * 4;
+        if(thdr < 20 || ihl + thdr > total || 14 + ihl + thdr > (size_t)rec) return;
+        if(total == ihl + thdr && !(l4[13] & 0x07)) return;  // no data, no SYN/FIN/RST
+    }
 
+    print_macs(f, buf);
     fprintf(f, "IP Header: IPv4\n\t");
     fprintf(f, "Header length: %d\n \tTotal length: %u\n \tTTL: %u\n \tProtocol: %u\n",
         ihl, total, ip[8], proto);
@@ -96,7 +151,6 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
     fprintf(f, "\tFlags: DF:%d MF %d\n", df, mf);
     fprintf(f, "\tFragment offset %u (%u bytes)\n\n", frag_of, frag_of * 8);
     //------------ End of ip -----------
-    const unsigned char *l4 = ip + ihl;
     size_t l4_len = total - ihl;
     size_t hdr = 0;
     const unsigned char *payload = NULL;
@@ -151,6 +205,11 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
     }
     payload = l4 + hdr;
     payload_len = total - ihl - hdr;
+    if (proto == 6 && payload_len > 0) {
+    char host[256];
+    if (extract_sni(payload, payload_len, host, sizeof host))
+        fprintf(f, "Website: %s\n", host);
+    }
     size_t avail = (size_t)rec - 14 - ihl - hdr;
     if(payload_len > avail) payload_len = avail;
     fprintf(f, "Message (%zu bytes):\n", payload_len);
