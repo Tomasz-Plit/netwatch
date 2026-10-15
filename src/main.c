@@ -1,4 +1,6 @@
 #include <math.h>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
 #include <netinet/in.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -14,6 +16,20 @@
 #include <sys/types.h>
 
 #define MAX_DUMP 256
+
+struct quic_initial {
+    uint32_t version;
+    const unsigned char *dcid; 
+    size_t dcid_len;
+    size_t pn_offset;
+    uint64_t length;
+};
+
+struct quic_keys{
+    unsigned char key[16];
+    unsigned char iv[12];
+    unsigned char hp[16];
+};
 
 static uint16_t rd16(const unsigned char *p){ return (p[0] << 8) | p[1]; }
 static uint32_t rd32(const unsigned char *p){
@@ -63,6 +79,81 @@ static void print_payload(FILE *f, const unsigned char *p, size_t len){
         }
     }
     if(len > shown) fprintf(f, "\t... %zu more bytes not shown \n", len - shown);
+}
+
+static int read_variant(const unsigned char *p, size_t len, size_t *pos, uint64_t *out){
+    if (*pos >= len) return 0;
+    size_t n = (size_t)1 << (p[*pos] >> 6);          // 1, 2, 4 or 8 bytes
+    if (*pos + n > len) return 0;
+    uint64_t v = p[*pos] & 0x3f;                     // drop the 2 length bits
+    for (size_t k = 1; k < n; k++) v = (v << 8) | p[*pos + k];
+    *pos += n;
+    *out = v;
+    return 1;
+}
+
+static int parse_quic_initial(const unsigned char *p, size_t len, struct quic_initial *q){
+    if (len < 7) return 0;
+    if ((p[0] & 0xC0) != 0xC0) return 0;             
+    if (((p[0] >> 4) & 3) != 0) return 0;            
+    q->version = rd32(p + 1);
+    if (q->version != 1) return 0;                   // We do not process any other versions at least for now
+
+    size_t i = 5;
+    size_t dcil = p[i++];
+    if (dcil > 20 || i + dcil + 1 > len) return 0;
+    q->dcid = p + i;  q->dcid_len = dcil;
+    i += dcil;
+
+    size_t scil = p[i++];
+    if (scil > 20 || i + scil > len) return 0;
+    i += scil;
+
+    uint64_t tok;
+    if (!read_variant(p, len, &i, &tok) || tok > len - i) return 0;
+    i += tok;
+
+    if (!read_variant(p, len, &i, &q->length)) return 0;
+    if (q->length > len - i) return 0;               
+    q->pn_offset = i;
+    return 1;
+}
+
+static int hkdf_expand_label(const unsigned char *secret, const char *label, unsigned char *out, size_t outlen) {
+    unsigned char info[64];
+    size_t ll = strlen(label), n = 0;
+
+    info[n++] = 0;                       // output length, high byte
+    info[n++] = (unsigned char)outlen;   // output length, low byte
+    info[n++] = (unsigned char)(6 + ll); // length of "tls13 " + label
+    memcpy(info + n, "tls13 ", 6); n += 6;
+    memcpy(info + n, label, ll);   n += ll;
+    info[n++] = 0;                       // empty context
+    info[n++] = 1;                       // HKDF-Expand counter
+
+    unsigned char t[32];
+    unsigned int tl = 0;
+    if (!HMAC(EVP_sha256(), secret, 32, info, n, t, &tl)) return 0;
+    memcpy(out, t, outlen);
+    return 1;
+}
+
+static int derive_initial_keys(const unsigned char *dcid, size_t dcid_len, struct quic_keys *k) {
+    static const unsigned char salt[20] = {
+        0x38,0x76,0x2c,0xf7,0xf5,0x59,0x34,0xb3,0x4d,0x17,
+        0x9a,0xe6,0xa4,0xc8,0x0c,0xad,0xcc,0xbb,0x7f,0x0a };   // QUIC v1 salt
+    
+    
+    unsigned char initial[32], client[32];
+    unsigned int len = 0;
+
+
+    if (!HMAC(EVP_sha256(), salt, sizeof salt, dcid, dcid_len, initial, &len)) return 0;
+    if (!hkdf_expand_label(initial, "client in", client, 32)) return 0;
+    if (!hkdf_expand_label(client, "quic key", k->key, 16)) return 0;
+    if (!hkdf_expand_label(client, "quic iv",  k->iv,  12)) return 0;
+    if (!hkdf_expand_label(client, "quic hp",  k->hp,  16)) return 0;
+    return 1;
 }
 
 static int extract_sni(const unsigned char *p, size_t len, char *out, size_t outsz) {
@@ -209,6 +300,13 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
     char host[256];
     if (extract_sni(payload, payload_len, host, sizeof host))
         fprintf(f, "Website: %s\n", host);
+    }
+    if (proto == 17 && payload_len > 0 && rd16(l4 + 2) == 443) {   // client -> server only
+        struct quic_initial q;
+        if (parse_quic_initial(payload, payload_len, &q)) {
+            fprintf(f, "QUIC Initial: version %u, DCID length %zu, length field %llu\n",
+                    q.version, q.dcid_len, (unsigned long long)q.length);
+        }
     }
     size_t avail = (size_t)rec - 14 - ihl - hdr;
     if(payload_len > avail) payload_len = avail;
