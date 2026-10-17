@@ -16,6 +16,15 @@
 #include <sys/types.h>
 
 #define MAX_DUMP 256
+#define CH_MAX 4096
+
+static struct {
+    unsigned char dcid[20];
+    size_t dcid_len;
+    unsigned char data[CH_MAX];
+    unsigned char have[CH_MAX];
+    int done;
+} ch;
 
 struct quic_initial {
     uint32_t version;
@@ -66,19 +75,20 @@ static void print_payload(FILE *f, const unsigned char *p, size_t len){
 
     for(size_t off = 0; off < shown; off += 16){
         fprintf(f, "\t%04zx ", off);
-        
+
         for(size_t i = 0; i < 16; i++){
             if(off + i < shown) fprintf(f, "%02x ", p[off + i]);
-            else                fprintf(f, "    ");
+            else                fprintf(f, "   ");
         }
 
-        fprintf(f, "\n");
+        fprintf(f, " ");
         for(size_t i = 0; i < 16 && off + i < shown; i++){
             unsigned char c = p[off + i];
-            fputc((c >= 32 && c < 127) ? c : '.', f);
+            fprintf(f, "%c", (c >= 32 && c < 127) ? c : '.');
         }
+        fprintf(f, "\n");
     }
-    if(len > shown) fprintf(f, "\t... %zu more bytes not shown \n", len - shown);
+    if(len > shown) fprintf(f, "\t... %zu more bytes not shown\n", len - shown);
 }
 
 static int read_variant(const unsigned char *p, size_t len, size_t *pos, uint64_t *out){
@@ -156,26 +166,92 @@ static int derive_initial_keys(const unsigned char *dcid, size_t dcid_len, struc
     return 1;
 }
 
-static int extract_sni(const unsigned char *p, size_t len, char *out, size_t outsz) {
-    if (len < 9 || p[0] != 0x16 || p[1] != 0x03) return 0;  // TLS handshake record
-    size_t i = 5;                                           // skip record header
-    if (p[i] != 0x01) return 0;                             // must be ClientHello
-    i += 4;                                                 // handshake header
-    i += 2 + 32;                                            // version + random
+static int quic_unprotect_header(const unsigned char *p, size_t len, const struct quic_initial *q,
+            const unsigned char *hp, unsigned char *first, size_t *pn_len, uint32_t *pn) {
+    if (q->length < 20) return 0;                    // 4 (max pn) + 16 (sample)
+    size_t sample_off = q->pn_offset + 4;
+    if (sample_off + 16 > len) return 0;
 
-    if (i + 1 > len) return 0;
-    i += 1 + p[i];                                          // session ID
+    unsigned char mask[16];
+    int outl = 0;
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return 0;
+    int ok = EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), NULL, hp, NULL)
+          && EVP_CIPHER_CTX_set_padding(ctx, 0)
+          && EVP_EncryptUpdate(ctx, mask, &outl, p + sample_off, 16)
+          && outl == 16;
+    EVP_CIPHER_CTX_free(ctx);
+    if (!ok) return 0;
 
+    *first  = p[0] ^ (mask[0] & 0x0f);
+    *pn_len = (size_t)(*first & 0x03) + 1;
+
+    uint32_t v = 0;
+    for (size_t i = 0; i < *pn_len; i++)
+        v = (v << 8) | (p[q->pn_offset + i] ^ mask[1 + i]);
+    *pn = v;
+    return 1;
+}
+
+static int quic_decrypt_initial(const unsigned char *p, size_t len, const struct quic_initial *q,
+            const struct quic_keys *k,unsigned char first, size_t pn_len, uint32_t pn,
+            unsigned char *out, size_t outsz, size_t *out_len) {
+    size_t hdr_len = q->pn_offset + pn_len;           // header ends after the packet number
+    if (hdr_len > 512 || hdr_len > len) return 0;
+    if (q->length < pn_len + 16) return 0;            
+    size_t ct_len = q->length - pn_len - 16;
+    if (ct_len > outsz) return 0;
+    if (hdr_len + ct_len + 16 > len) return 0;
+
+    // 1. nonce = iv XOR packet number
+    unsigned char nonce[12];
+    memcpy(nonce, k->iv, 12);
+    for (int i = 0; i < 4; i++)
+        nonce[11 - i] ^= (unsigned char)(pn >> (8 * i));
+
+    // 2. AAD = header with the real first byte and real packet number
+    unsigned char aad[512];
+    memcpy(aad, p, hdr_len);
+    aad[0] = first;
+    for (size_t i = 0; i < pn_len; i++)
+        aad[q->pn_offset + pn_len - 1 - i] = (unsigned char)(pn >> (8 * i));
+
+    // 3. ciphertext and tag
+    const unsigned char *ct  = p + hdr_len;
+    unsigned char tag[16];
+    memcpy(tag, ct + ct_len, 16);
+
+    // 4. AES-128-GCM decrypt
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return 0;
+    int l = 0, l2 = 0;
+    int ok = EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL)
+          && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL)
+          && EVP_DecryptInit_ex(ctx, NULL, NULL, k->key, nonce)
+          && EVP_DecryptUpdate(ctx, NULL, &l, aad, (int)hdr_len)
+          && EVP_DecryptUpdate(ctx, out, &l, ct, (int)ct_len)
+          && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, tag)
+          && EVP_DecryptFinal_ex(ctx, out + l, &l2) > 0;
+    EVP_CIPHER_CTX_free(ctx);
+    if (!ok) return 0;
+
+    *out_len = (size_t)(l + l2);
+    return 1;
+}
+
+static int extract_sni_hs(const unsigned char *p, size_t len, char *out, size_t outsz) {
+    if (len < 4 + 2 + 32 + 1 || p[0] != 0x01) return 0;   // ClientHello + room for the fixed part
+    size_t i = 4 + 2 + 32;                                // handshake header + version + random
+
+    i += 1 + p[i];                                        // session ID
     if (i + 2 > len) return 0;
-    i += 2 + rd16(p + i);                                   // cipher suites
-
+    i += 2 + rd16(p + i);                                 // cipher suites
     if (i + 1 > len) return 0;
-    i += 1 + p[i];                                          // compression methods
-
+    i += 1 + p[i];                                        // compression methods
     if (i + 2 > len) return 0;
-    size_t end = i + 2 + rd16(p + i);                       // end of extensions
+    size_t end = i + 2 + rd16(p + i);                     // end of extensions
     i += 2;
-    if (end > len) end = len;                               // ClientHello may be cut off
+    if (end > len) end = len;                             // ClientHello may be cut off
 
     while (i + 4 <= end) {
         uint16_t type = rd16(p + i);
@@ -183,11 +259,11 @@ static int extract_sni(const unsigned char *p, size_t len, char *out, size_t out
         i += 4;
         if (i + elen > end) return 0;
 
-        if (type == 0x0000) {                               // server_name
+        if (type == 0x0000) {                             // server_name
             if (elen < 5) return 0;
-            uint16_t nlen = rd16(p + i + 3);                // skip list len (2) + name type (1)
+            uint16_t nlen = rd16(p + i + 3);
             if (5 + nlen > elen || nlen >= outsz) return 0;
-            for (uint16_t k = 0; k < nlen; k++) {           // hostname must be printable
+            for (uint16_t k = 0; k < nlen; k++) {
                 unsigned char c = p[i + 5 + k];
                 if (c <= 32 || c >= 127) return 0;
             }
@@ -195,11 +271,54 @@ static int extract_sni(const unsigned char *p, size_t len, char *out, size_t out
             out[nlen] = '\0';
             return 1;
         }
-        i += elen;                                          // next extension
+        i += elen;
     }
     return 0;
 }
 
+static int extract_sni(const unsigned char *p, size_t len, char *out, size_t outsz) {
+    if (len < 9 || p[0] != 0x16 || p[1] != 0x03) return 0;   // TLS record header
+    return extract_sni_hs(p + 5, len - 5, out, outsz);       // skip it
+}
+
+static int quic_find_sni(const unsigned char *pl, size_t len,
+                         const unsigned char *dcid, size_t dcid_len,
+                         char *out, size_t outsz) {
+    // new connection (different DCID) -> start over
+    if (ch.dcid_len != dcid_len || memcmp(ch.dcid, dcid, dcid_len) != 0) {
+        memset(&ch, 0, sizeof ch);
+        memcpy(ch.dcid, dcid, dcid_len);
+        ch.dcid_len = dcid_len;
+    }
+    if (ch.done) return 0;
+
+    size_t i = 0;
+    while (i < len) {
+        uint64_t type;
+        if (!read_variant(pl, len, &i, &type)) break;
+        if (type == 0x00 || type == 0x01) continue;      // padding, ping
+        if (type != 0x06) break;                         // unknown frame: stop
+
+        uint64_t off, clen;
+        if (!read_variant(pl, len, &i, &off)) break;
+        if (!read_variant(pl, len, &i, &clen)) break;
+        if (clen > len - i) break;
+        if (off <= CH_MAX && clen <= CH_MAX - off) {     // fits in our buffer
+            memcpy(ch.data + off, pl + i, clen);
+            memset(ch.have + off, 1, clen);
+        }
+        i += clen;
+    }
+
+    size_t prefix = 0;                                   // bytes received without a gap
+    while (prefix < CH_MAX && ch.have[prefix]) prefix++;
+
+    if (extract_sni_hs(ch.data, prefix, out, outsz)) {
+        ch.done = 1;
+        return 1;
+    }
+    return 0;
+}
 static void print_macs(FILE *f, const unsigned char *buf){
     fprintf(f, "Source MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
         buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]);
@@ -294,22 +413,49 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
         sport, dport, udp_len, udp_ck);
         hdr = 8;
     }
+    // Getting the address in TCP Header
     payload = l4 + hdr;
+    if (total < ihl + hdr) return;                  // guard against underflow
     payload_len = total - ihl - hdr;
+    size_t avail = (size_t)rec - 14 - ihl - hdr;
+    if (payload_len > avail) payload_len = avail;
     if (proto == 6 && payload_len > 0) {
     char host[256];
     if (extract_sni(payload, payload_len, host, sizeof host))
         fprintf(f, "Website: %s\n", host);
     }
+    // Getting the address in UDP Header
     if (proto == 17 && payload_len > 0 && rd16(l4 + 2) == 443) {   // client -> server only
         struct quic_initial q;
         if (parse_quic_initial(payload, payload_len, &q)) {
             fprintf(f, "QUIC Initial: version %u, DCID length %zu, length field %llu\n",
                     q.version, q.dcid_len, (unsigned long long)q.length);
+
+            struct quic_keys k;
+            unsigned char first;
+            size_t pn_len;
+            uint32_t pn;
+            if (derive_initial_keys(q.dcid, q.dcid_len, &k) &&
+                quic_unprotect_header(payload, payload_len, &q, k.hp, &first, &pn_len, &pn)) {
+                fprintf(f, "\tfirst byte 0x%02x, packet number %u (%zu bytes)\n",
+                        first, pn, pn_len);
+
+                unsigned char plain[2048];
+                size_t plain_len = 0;
+                if (quic_decrypt_initial(payload, payload_len, &q, &k, first, pn_len, pn,
+                                         plain, sizeof plain, &plain_len)) {
+                    fprintf(f, "\tQUIC decrypted: %zu bytes of frames\n", plain_len);
+                    print_payload(f, plain, plain_len);
+                    char host[256];
+                    if (quic_find_sni(plain, plain_len, q.dcid, q.dcid_len, host, sizeof host))
+                        fprintf(f, "Website (QUIC): %s\n", host);
+                } 
+                else {
+                    fprintf(f, "\tQUIC decryption failed\n");
+                }
+            }
         }
     }
-    size_t avail = (size_t)rec - 14 - ihl - hdr;
-    if(payload_len > avail) payload_len = avail;
     fprintf(f, "Message (%zu bytes):\n", payload_len);
     if(payload_len > 0){
         print_payload(f, payload, payload_len);
