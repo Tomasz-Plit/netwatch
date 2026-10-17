@@ -1,4 +1,3 @@
-#include <math.h>
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
 #include <netinet/in.h>
@@ -14,6 +13,9 @@
 #include <linux/if_packet.h>
 #include <net/if.h>
 #include <sys/types.h>
+#include <unistd.h>
+
+// ===================== config and data types =====================
 
 #define MAX_DUMP 256
 #define CH_MAX 4096
@@ -39,16 +41,17 @@ struct quic_keys{
     unsigned char iv[12];
     unsigned char hp[16];
 };
+// ===================== helpers: byte readers =====================
 
 static uint16_t rd16(const unsigned char *p){ return (p[0] << 8) | p[1]; }
 static uint32_t rd32(const unsigned char *p){
     return ((uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | (uint32_t)p[3]);
 }
-
+// ===================== capture: raw socket =====================
 
 int open_raw_socket(const char *ifname){
     int sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    if (sockfd == -1) {perror("socket"); return -1;}
+    if (sockfd == -1) {perror("socket"); close(sockfd); return -1;}
     struct sockaddr_ll address;
     memset(&address, 0, sizeof(address));
     address.sll_family = AF_PACKET;
@@ -56,7 +59,7 @@ int open_raw_socket(const char *ifname){
     address.sll_ifindex = if_nametoindex(ifname);
     if (address.sll_ifindex == 0) { perror("if_nametoindex"); return -1; }  
     if (bind(sockfd, (struct sockaddr *)&address, sizeof address) == -1) {
-        perror("bind");
+        perror("bind"); close(sockfd);
         return -1;
     }
     return sockfd;
@@ -69,6 +72,7 @@ ssize_t recieve_packet(int sockfd, unsigned char *buf, size_t size){
     if(rec == -1) {perror("recvfrom");}
     return rec;
 }
+// ===================== output helpers =====================
 
 static void print_payload(FILE *f, const unsigned char *p, size_t len){
     size_t shown = len > MAX_DUMP ? MAX_DUMP : len;
@@ -90,6 +94,7 @@ static void print_payload(FILE *f, const unsigned char *p, size_t len){
     }
     if(len > shown) fprintf(f, "\t... %zu more bytes not shown\n", len - shown);
 }
+// ----- helper: QUIC variant -----
 
 static int read_variant(const unsigned char *p, size_t len, size_t *pos, uint64_t *out){
     if (*pos >= len) return 0;
@@ -101,6 +106,7 @@ static int read_variant(const unsigned char *p, size_t len, size_t *pos, uint64_
     *out = v;
     return 1;
 }
+// ===================== QUIC (Initial packets) =====================
 
 static int parse_quic_initial(const unsigned char *p, size_t len, struct quic_initial *q){
     if (len < 7) return 0;
@@ -238,6 +244,7 @@ static int quic_decrypt_initial(const unsigned char *p, size_t len, const struct
     *out_len = (size_t)(l + l2);
     return 1;
 }
+// ===================== TLS / SNI =====================
 
 static int extract_sni_hs(const unsigned char *p, size_t len, char *out, size_t outsz) {
     if (len < 4 + 2 + 32 + 1 || p[0] != 0x01) return 0;   // ClientHello + room for the fixed part
@@ -280,6 +287,7 @@ static int extract_sni(const unsigned char *p, size_t len, char *out, size_t out
     if (len < 9 || p[0] != 0x16 || p[1] != 0x03) return 0;   // TLS record header
     return extract_sni_hs(p + 5, len - 5, out, outsz);       // skip it
 }
+// ----- QUIC: ClientHello reassembly (needs extract_sni_hs above) -----
 
 static int quic_find_sni(const unsigned char *pl, size_t len,
                          const unsigned char *dcid, size_t dcid_len,
@@ -319,6 +327,8 @@ static int quic_find_sni(const unsigned char *pl, size_t len,
     }
     return 0;
 }
+// ===================== packet logging =====================
+
 static void print_macs(FILE *f, const unsigned char *buf){
     fprintf(f, "Source MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
         buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]);
@@ -331,9 +341,9 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
     if(rec < 14) return;
     if(rd16(buf + 12) != 0x0800) {print_macs(f, buf); fprintf(f, "not an IPv4 \n\n"); return;}
     if(rec < 14 + 20) return;
-    
+    size_t n = (size_t)rec;
     const unsigned char *ip = buf + 14;
-    int ihl = (ip[0] & 0x0f) * 4;
+    size_t ihl = (ip[0] & 0x0f) * 4;
     uint16_t total = rd16(ip + 2);
     uint8_t proto = ip[9];
     uint16_t id = rd16(ip + 4);
@@ -343,9 +353,10 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
     int mf = (flags >> 13) & 1;
     uint16_t frag_of = flags & 0x1FFF;
     const unsigned char *l4 = ip + ihl;
+    if(ihl < 20 || n < 14 + ihl)
     // silent filter, ACK provide no vale so we silent them
     if(proto == 6 && frag_of == 0){
-        if(total < ihl + 20 || (size_t)rec < 14 + ihl + 20) return;
+        if(total < ihl + 20 || n < 14 + ihl + 20) return;
         size_t thdr = (l4[12] >> 4) * 4;
         if(thdr < 20 || ihl + thdr > total || 14 + ihl + thdr > (size_t)rec) return;
         if(total == ihl + thdr && !(l4[13] & 0x07)) return;  // no data, no SYN/FIN/RST
@@ -381,7 +392,7 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
         fprintf(f, "TCP Header:\n\t Src port: %u\n\t Dst port: %u\n", sport, dport);
         fprintf(f, "\t Sequence number: %u\n\t Acknowledgement number: %u\n\t Header length: %zu bytes\n",
         seq, ack, hdr);
-        fprintf(f, "\t Flags: 0x%02x [%s%s%s%s%s%s%s]\n", fl,
+        fprintf(f, "\t Flags: 0x%02x [%s%s%s%s%s%s%s%s]\n", fl,
             (fl & 0x80) ? "CWR " : "",
             (fl & 0x40) ? "ECE " : "",
             (fl & 0x20) ? "URG " : "",
@@ -390,7 +401,7 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
             (fl & 0x04) ? "RST " : "",
             (fl & 0x02) ? "SYN " : "",
             (fl & 0x01) ? "FIN " : "");
-        fprintf(f, "\t Window ize: %u\n\t Checksum: 0x%04x\n\t Urgent pointer: %u\n",
+        fprintf(f, "\t Window size: %u\n\t Checksum: 0x%04x\n\t Urgent pointer: %u\n",
             window, tcp_ck, urgent);
         
         if(hdr > 20){
@@ -412,6 +423,11 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
         fprintf(f, "UDP Header: \n\t Src port: %u\n\t Dst port: %u\n\t Length: %u\n\t Checksum: 0x%04x\n",
         sport, dport, udp_len, udp_ck);
         hdr = 8;
+    }
+    else{
+        fprintf(f, "Other protocol: %u (skipped)\n\n", proto);
+        fprintf(f, "----------------------------------------------------");
+        return;
     }
     // Getting the address in TCP Header
     payload = l4 + hdr;
@@ -464,10 +480,10 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
     fprintf(f, "\n ---------------------------------------------\n");
     return;
 }
-
+// ===================== main =====================
 
 int main(void){
-    int sockfd = open_raw_socket("wlp0s20f3:");
+    int sockfd = open_raw_socket("wlp0s20f3");
     if(sockfd == -1) return 1;
 
     FILE *logfile = fopen("netwatch.log", "w");
@@ -477,7 +493,8 @@ int main(void){
     unsigned char buffer[65535];
 
     while(1){
-        ssize_t rec = recieve_packet(sockfd, buffer, sizeof(buffer));   
+        ssize_t rec = recieve_packet(sockfd, buffer, sizeof(buffer));  
+        if (rec == -1) continue; 
         log_packet(logfile, buffer, rec);
     }
     return 0;
