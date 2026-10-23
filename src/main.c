@@ -19,6 +19,7 @@
 
 #define MAX_DUMP 256
 #define CH_MAX 4096
+#define MAX_HOSTS 256
 
 static struct {
     unsigned char dcid[20];
@@ -41,6 +42,16 @@ struct quic_keys{
     unsigned char iv[12];
     unsigned char hp[16];
 };
+
+struct host_stat{
+    char name[256];
+    unsigned long count;
+    time_t last_seen;
+};
+
+static struct host_stat hosts[MAX_HOSTS];
+static size_t nhosts;
+
 // ===================== helpers: byte readers =====================
 
 static uint16_t rd16(const unsigned char *p){ return (p[0] << 8) | p[1]; }
@@ -327,6 +338,36 @@ static int quic_find_sni(const unsigned char *pl, size_t len,
     }
     return 0;
 }
+// ===================== statistics =====================
+
+static void host_seen(const char *name){
+    for(size_t i = 0; i < nhosts; i++){
+        if(strcmp(hosts[i].name, name) == 0){
+            hosts[i].count++;
+            hosts[i].last_seen = time(NULL);
+            return;
+        }
+    }
+    if(nhosts == MAX_HOSTS) return;
+    snprintf(hosts[nhosts].name, sizeof hosts[nhosts].name, "%s", name);
+    hosts[nhosts].count = 1;
+    hosts[nhosts].last_seen = time(NULL);
+    nhosts++;
+}
+
+static void stats_print(FILE *out){
+    fprintf(out, "\n === hosts seen: %zu ===\n", nhosts);
+    fprintf(out, "%-6s %-40s %s\n", "COUNT", "HOST", "LAST SEEN");
+    for (size_t i = 0; i < nhosts; i++) {
+        char when[16];
+        struct tm tmv;
+        localtime_r(&hosts[i].last_seen, &tmv);
+        strftime(when, sizeof when, "%H:%M:%S", &tmv);
+
+        fprintf(out, "%-6lu %-40s %s\n", hosts[i].count, hosts[i].name, when);
+    fflush(out);
+    }    
+}
 // ===================== packet logging =====================
 
 static void print_macs(FILE *f, const unsigned char *buf){
@@ -353,7 +394,7 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
     int mf = (flags >> 13) & 1;
     uint16_t frag_of = flags & 0x1FFF;
     const unsigned char *l4 = ip + ihl;
-    if(ihl < 20 || n < 14 + ihl)
+    if(ihl < 20 || n < 14 + ihl) return;
     // silent filter, ACK provide no vale so we silent them
     if(proto == 6 && frag_of == 0){
         if(total < ihl + 20 || n < 14 + ihl + 20) return;
@@ -364,7 +405,7 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
 
     print_macs(f, buf);
     fprintf(f, "IP Header: IPv4\n\t");
-    fprintf(f, "Header length: %d\n \tTotal length: %u\n \tTTL: %u\n \tProtocol: %u\n",
+    fprintf(f, "Header length: %ld\n \tTotal length: %u\n \tTTL: %u\n \tProtocol: %u\n",
         ihl, total, ip[8], proto);
     fprintf(f, "\tid: %u\n \tcheck_sum: %u\n", id, check_sum);
     fprintf(f, "\tSrc IP: %u.%u.%u.%u \n", ip[12], ip[13], ip[14], ip[15]);
@@ -436,9 +477,11 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
     size_t avail = (size_t)rec - 14 - ihl - hdr;
     if (payload_len > avail) payload_len = avail;
     if (proto == 6 && payload_len > 0) {
-    char host[256];
-    if (extract_sni(payload, payload_len, host, sizeof host))
-        fprintf(f, "Website: %s\n", host);
+        char host[256];
+        if (extract_sni(payload, payload_len, host, sizeof host)){
+            fprintf(f, "Website: %s\n", host);
+            host_seen(host);
+        }
     }
     // Getting the address in UDP Header
     if (proto == 17 && payload_len > 0 && rd16(l4 + 2) == 443) {   // client -> server only
@@ -463,8 +506,10 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
                     fprintf(f, "\tQUIC decrypted: %zu bytes of frames\n", plain_len);
                     print_payload(f, plain, plain_len);
                     char host[256];
-                    if (quic_find_sni(plain, plain_len, q.dcid, q.dcid_len, host, sizeof host))
+                    if (quic_find_sni(plain, plain_len, q.dcid, q.dcid_len, host, sizeof host)){
                         fprintf(f, "Website (QUIC): %s\n", host);
+                        host_seen(host);
+                    }
                 } 
                 else {
                     fprintf(f, "\tQUIC decryption failed\n");
@@ -492,10 +537,14 @@ int main(void){
 
     unsigned char buffer[65535];
 
+    time_t last_print = time(NULL);
     while(1){
         ssize_t rec = recieve_packet(sockfd, buffer, sizeof(buffer));  
         if (rec == -1) continue; 
         log_packet(logfile, buffer, rec);
+
+        time_t now = time(NULL);
+        if(now - last_print > 10){ stats_print(stdout); last_print = now; }
     }
     return 0;
 }
