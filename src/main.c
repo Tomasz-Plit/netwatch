@@ -18,6 +18,7 @@
 #include <linux/if_arp.h>
 #include <signal.h>
 #include <errno.h>
+#include <sys/select.h>
 
 // ===================== config and data types =====================
 
@@ -200,6 +201,98 @@ static int arp_resolve(int sockfd, int ifindex,
     fprintf(stderr, "arp_resolve: no reply from %u.%u.%u.%u\n",
             target_ip[0], target_ip[1], target_ip[2], target_ip[3]);
     return 0;
+}
+
+static int discover_hosts(const char *ifname, int ifindex) {
+    unsigned char our_ip[4], our_mac[6];
+    if (!get_own_ip(ifname, our_ip) || !get_own_mac(ifname, our_mac)) return 0;
+
+    int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
+    if (fd < 0) { perror("socket (discovery)"); return 0; }
+    struct sockaddr_ll bind_addr;
+    memset(&bind_addr, 0, sizeof bind_addr);
+    bind_addr.sll_family = AF_PACKET;
+    bind_addr.sll_protocol = htons(ETH_P_ARP);
+    bind_addr.sll_ifindex = ifindex;
+    if (bind(fd, (struct sockaddr *)&bind_addr, sizeof bind_addr) < 0) {
+        perror("bind (discovery)"); close(fd); return 0;
+    }
+
+    int ctl = socket(AF_INET, SOCK_DGRAM, 0);
+    if (ctl < 0) { perror("socket (interface config)"); close(fd); return 0; }
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof ifr);
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname);
+    if (ioctl(ctl, SIOCGIFNETMASK, &ifr) < 0) {
+        perror("ioctl SIOCGIFNETMASK"); close(ctl); close(fd); return 0;
+    }
+    close(ctl);
+
+    uint32_t ip, mask;
+    memcpy(&ip, our_ip, sizeof ip);
+    memcpy(&mask, &((struct sockaddr_in *)&ifr.ifr_netmask)->sin_addr.s_addr, sizeof mask);
+    uint32_t host_ip = ntohl(ip), host_mask = ntohl(mask);
+    uint32_t network = host_ip & host_mask;
+    uint32_t broadcast = network | ~host_mask;
+    if (broadcast <= network + 1 || broadcast - network > 4097) {
+        fprintf(stderr, "local subnet is too large or has no usable hosts for ARP discovery\n");
+        close(fd); return 0;
+    }
+
+    struct sockaddr_ll addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sll_family = AF_PACKET;
+    addr.sll_ifindex = ifindex;
+    addr.sll_halen = 6;
+    memset(addr.sll_addr, 0xff, 6);
+
+    for (uint32_t h = network + 1; h < broadcast; h++) {
+        if (h == host_ip) continue;
+        uint32_t candidate = htonl(h);
+        unsigned char target_ip[4];
+        memcpy(target_ip, &candidate, sizeof target_ip);
+        unsigned char pkt[42] = {0};
+        memset(pkt, 0xff, 6);
+        memcpy(pkt + 6, our_mac, 6);
+        pkt[12] = 0x08; pkt[13] = 0x06;
+        pkt[14] = 0x00; pkt[15] = 0x01;
+        pkt[16] = 0x08; pkt[17] = 0x00;
+        pkt[18] = 6; pkt[19] = 4; pkt[21] = 1;
+        memcpy(pkt + 22, our_mac, 6);
+        memcpy(pkt + 28, our_ip, 4);
+        memcpy(pkt + 38, target_ip, 4);
+        if (sendto(fd, pkt, sizeof pkt, 0, (struct sockaddr *)&addr, sizeof addr) < 0) {
+            perror("sendto (discovery)"); close(fd); return 0;
+        }
+    }
+
+    printf("Reachable IPv4 addresses on %s:\n", ifname);
+    unsigned char seen[4096] = {0};
+    while (1) {
+        fd_set ready;
+        FD_ZERO(&ready);
+        FD_SET(fd, &ready);
+        struct timeval timeout = { .tv_sec = 2, .tv_usec = 0 };
+        int result = select(fd + 1, &ready, NULL, NULL, &timeout);
+        if (result < 0) {
+            if (errno == EINTR) continue;
+            perror("select (discovery)"); close(fd); return 0;
+        }
+        if (result == 0) break;
+        unsigned char buf[128];
+        ssize_t n = recvfrom(fd, buf, sizeof buf, 0, NULL, NULL);
+        if (n < 42 || buf[12] != 0x08 || buf[13] != 0x06 ||
+            buf[20] != 0x00 || buf[21] != 0x02) continue;
+        uint32_t sender;
+        memcpy(&sender, buf + 28, sizeof sender);
+        uint32_t sender_host = ntohl(sender);
+        if (sender_host <= network || sender_host >= broadcast || sender_host == host_ip ||
+            sender_host - network >= sizeof seen || seen[sender_host - network]) continue;
+        seen[sender_host - network] = 1;
+        printf("%u.%u.%u.%u\n", buf[28], buf[29], buf[30], buf[31]);
+    }
+    close(fd);
+    return 1;
 }
 
 static int arp_send_reply(int sockfd, int ifindex,
@@ -731,16 +824,30 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
 
 int main(int argc, char *argv[]) {
     int do_spoof = 0;
+    int do_discover = 0;
     const char *target_ip_str = NULL;
     const char *gateway_ip_str = NULL;
 
     // Simple argument parsing: ./netwatch --spoof <target-ip> <gateway-ip>
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--spoof") == 0 && i + 2 < argc) {
+        if (strcmp(argv[i], "--all") == 0) {
+            do_discover = 1;
+        } else if (strcmp(argv[i], "--spoof") == 0 && i + 2 < argc) {
             target_ip_str  = argv[++i];
             gateway_ip_str = argv[++i];
             do_spoof = 1;
         }
+    }
+
+    if (do_discover && do_spoof) {
+        fprintf(stderr, "--all cannot be combined with --spoof\n");
+        return 1;
+    }
+
+    if (do_discover) {
+        int ifindex = (int)if_nametoindex(IFNAME);
+        if (ifindex == 0) { fprintf(stderr, "unknown interface: %s\n", IFNAME); return 1; }
+        return discover_hosts(IFNAME, ifindex) ? 0 : 1;
     }
 
     signal(SIGINT, sigint_handler);
