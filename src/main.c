@@ -51,6 +51,7 @@ struct quic_keys{
 
 struct host_stat{
     char name[256];
+    char ip[16];
     unsigned long count;
     time_t last_seen;
 };
@@ -242,6 +243,7 @@ static int discover_hosts(const char *ifname, int ifindex) {
     struct sockaddr_ll addr;
     memset(&addr, 0, sizeof addr);
     addr.sll_family = AF_PACKET;
+    addr.sll_protocol = htons(ETH_P_ARP);
     addr.sll_ifindex = ifindex;
     addr.sll_halen = 6;
     memset(addr.sll_addr, 0xff, 6);
@@ -635,9 +637,11 @@ static int quic_find_sni(const unsigned char *pl, size_t len,
 }
 // ===================== statistics =====================
 
-static void host_seen(const char *name){
+static void host_seen(const char *name, const unsigned char *ip){
+    char ip_str[16];
+    snprintf(ip_str, sizeof ip_str, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
     for(size_t i = 0; i < nhosts; i++){
-        if(strcmp(hosts[i].name, name) == 0){
+        if(strcmp(hosts[i].name, name) == 0 && strcmp(hosts[i].ip, ip_str) == 0){
             hosts[i].count++;
             hosts[i].last_seen = time(NULL);
             return;
@@ -645,21 +649,22 @@ static void host_seen(const char *name){
     }
     if(nhosts == MAX_HOSTS) return;
     snprintf(hosts[nhosts].name, sizeof hosts[nhosts].name, "%s", name);
+    snprintf(hosts[nhosts].ip, sizeof hosts[nhosts].ip, "%s", ip_str);
     hosts[nhosts].count = 1;
     hosts[nhosts].last_seen = time(NULL);
     nhosts++;
 }
 
 static void stats_print(FILE *out){
-    fprintf(out, "\n === hosts seen: %zu ===\n", nhosts);
-    fprintf(out, "%-6s %-40s %s\n", "COUNT", "HOST", "LAST SEEN");
+    fprintf(out, "\n === website visits: %zu ===\n", nhosts);
+    fprintf(out, "%-6s %-40s %-15s %s\n", "COUNT", "WEBSITE", "VISITOR IP", "LAST SEEN");
     for (size_t i = 0; i < nhosts; i++) {
         char when[16];
         struct tm tmv;
         localtime_r(&hosts[i].last_seen, &tmv);
         strftime(when, sizeof when, "%H:%M:%S", &tmv);
 
-        fprintf(out, "%-6lu %-40s %s\n", hosts[i].count, hosts[i].name, when);
+        fprintf(out, "%-6lu %-40s %-15s %s\n", hosts[i].count, hosts[i].name, hosts[i].ip, when);
     fflush(out);
     }    
 }
@@ -775,7 +780,7 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
         char host[256];
         if (extract_sni(payload, payload_len, host, sizeof host)){
             fprintf(f, "Website: %s\n", host);
-            host_seen(host);
+            host_seen(host, ip + 12);
         }
     }
     // Getting the address in UDP Header
@@ -803,7 +808,7 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
                     char host[256];
                     if (quic_find_sni(plain, plain_len, q.dcid, q.dcid_len, host, sizeof host)){
                         fprintf(f, "Website (QUIC): %s\n", host);
-                        host_seen(host);
+                        host_seen(host, ip + 12);
                     }
                 } 
                 else {
@@ -830,7 +835,7 @@ int main(int argc, char *argv[]) {
 
     // Simple argument parsing: ./netwatch --spoof <target-ip> <gateway-ip>
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--all") == 0) {
+        if (strcmp(argv[i], "--scan") == 0) {
             do_discover = 1;
         } else if (strcmp(argv[i], "--spoof") == 0 && i + 2 < argc) {
             target_ip_str  = argv[++i];
@@ -840,7 +845,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (do_discover && do_spoof) {
-        fprintf(stderr, "--all cannot be combined with --spoof\n");
+        fprintf(stderr, "--scan cannot be combined with --spoof\n");
         return 1;
     }
 
