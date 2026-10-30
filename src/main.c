@@ -6,6 +6,7 @@
 #include <net/if.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/socket.h>
@@ -13,6 +14,7 @@
 #include <sys/select.h>
 #include <unistd.h>
 #include "../include/packet_logging.h"
+#include "../include/port_lock.h"
 #include "../include/statistic.h"
 
 #define IFNAME "wlp0s20f3"
@@ -22,6 +24,7 @@ int main(int argc, char *argv[]) {
     int do_spoof = 0;
     int do_discover = 0;
     int do_all = 0;
+    unsigned port_filter = 0;
     const char *target_ip_strs[MAX_SPOOF_TARGETS];
     const char *gateway_ip_str = NULL;
     char generated_targets[MAX_SPOOF_TARGETS][16];
@@ -38,6 +41,16 @@ int main(int argc, char *argv[]) {
             do_all = 1;
         } else if (strcmp(argv[i], "--scan") == 0) {
             do_discover = 1;
+        } else if (strcmp(argv[i], "--restrict-port") == 0) {
+            if (port_filter || i + 1 >= argc || argv[i + 1][0] < '0' || argv[i + 1][0] > '9') {
+                fprintf(stderr, "usage: --restrict-port <1-65535>\n"); return 1;
+            }
+            char *end;
+            unsigned long value = strtoul(argv[++i], &end, 10);
+            if (*end || value == 0 || value > 65535) {
+                fprintf(stderr, "invalid port: %s\n", argv[i]); return 1;
+            }
+            port_filter = (unsigned)value;
         } else if (strcmp(argv[i], "--spoof") == 0) {
             if (i + 2 >= argc) {
                 fprintf(stderr, "usage: --spoof <target-ip> <gateway-ip> [target-ip ...]\n");
@@ -67,6 +80,10 @@ int main(int argc, char *argv[]) {
 
     if (do_discover && do_spoof) {
         fprintf(stderr, "--scan cannot be combined with --spoof\n");
+        return 1;
+    }
+    if (port_filter && (do_all || do_spoof || do_discover)) {
+        fprintf(stderr, "--restrict-port cannot be combined with scan or spoof modes\n");
         return 1;
     }
 
@@ -158,7 +175,7 @@ int main(int argc, char *argv[]) {
 
     int sockfd = open_raw_socket(IFNAME);
     if (sockfd == -1) return 1;
-    if (do_spoof) {
+    if (do_spoof || port_filter) {
         struct timeval receive_timeout = { .tv_sec = 1, .tv_usec = 0 };
         if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,
                        &receive_timeout, sizeof receive_timeout) < 0) {
@@ -170,6 +187,12 @@ int main(int argc, char *argv[]) {
     FILE *logfile = fopen("netwatch.log", "w");
     if (!logfile) { perror("fopen"); close(sockfd); return 1; }
     setvbuf(logfile, NULL, _IOLBF, 0);
+    int port_control = -1;
+    pid_t port_watcher = -1;
+    if (port_filter && !port_lock_start(port_filter, &port_control, &port_watcher)) {
+        fclose(logfile); close(sockfd); return 1;
+    }
+    if (port_filter) fprintf(stderr, "[port] outgoing TCP from local port %u allowed; DNS and existing connections remain available; Ctrl+C restores access\n", port_filter);
 
     int arp_sockfd = -1;
     if (do_spoof) {
@@ -243,7 +266,7 @@ int main(int argc, char *argv[]) {
     while (running) {
         ssize_t rec = recieve_packet(sockfd, buffer, sizeof(buffer));
         if (rec < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) continue;
-        if (rec > 0) log_packet(logfile, buffer, rec);
+        if (rec > 0) log_packet(logfile, buffer, rec, port_filter);
 
         time_t now = time(NULL);
         if (now - last_print > 10) { stats_print(stdout); last_print = now; }
@@ -263,6 +286,7 @@ int main(int argc, char *argv[]) {
 
     fclose(logfile);
     close(sockfd);
+    if (port_filter && !port_lock_stop(port_control, port_watcher)) return 1;
     if (spoof_lock_fd >= 0) close(spoof_lock_fd);
     fprintf(stderr, "[netwatch] clean shutdown\n");
     return 0;

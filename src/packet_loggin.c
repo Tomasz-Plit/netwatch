@@ -69,7 +69,7 @@ static void print_macs(FILE *f, const unsigned char *buf){
 
 }
 
-void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
+void log_packet(FILE *f, const unsigned char *buf, ssize_t rec, unsigned port_filter){
     if(rec < 14) return;
     if(rd16(buf + 12) != 0x0800) {print_macs(f, buf); fprintf(f, "not an IPv4 \n\n"); return;}
     if(rec < 14 + 20) return;
@@ -93,6 +93,8 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec){
         if(thdr < 20 || ihl + thdr > total || 14 + ihl + thdr > n) return;
         if(total == ihl + thdr && !(l4[13] & 0x07)) return;
     }
+    if (port_filter && (proto != 6 || frag_of != 0 ||
+        (rd16(l4) != port_filter && rd16(l4 + 2) != port_filter))) return;
 
     print_macs(f, buf);
     fprintf(f, "IP Header: IPv4\n\t");
