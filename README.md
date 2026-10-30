@@ -6,7 +6,7 @@ Use spoofing only on networks and devices you own or are authorized to inspect. 
 
 ## Build
 
-You need Linux, `gcc`, `make`, and the OpenSSL development headers and library (`libcrypto`). Raw packet sockets and changes to IPv4 forwarding require root privileges.
+You need Linux, `gcc`, `make`, and the OpenSSL development headers and library (`libcrypto`). Raw packet sockets and changes to IPv4 forwarding require root privileges. The port restriction also needs `nft` and permission to manage firewall rules.
 
 The interface name is currently set to `wlp0s20f3` in `IFNAME` near the top of `src/main.c`. Check yours with `ip -4 addr show`, change `IFNAME` if needed, then build:
 
@@ -18,6 +18,7 @@ make
 
 ```sh
 sudo ./netwatch
+sudo ./netwatch --restrict-port 45000
 sudo ./netwatch --scan
 sudo ./netwatch --spoof 192.168.1.134 192.168.1.1
 sudo ./netwatch --spoof 192.168.1.134 192.168.1.1 192.168.1.18
@@ -29,11 +30,16 @@ Replace the example target and gateway IPs with addresses from your own network.
 | Mode | Behavior |
 | --- | --- |
 | No flag | Capture packets visible to this computer. |
+| `--restrict-port PORT` | Capture and log TCP traffic using this local port while temporarily rejecting other new connections. Cannot be combined with scan or spoof modes. |
 | `--scan` | Send ARP requests across the local IPv4 subnet, print devices that reply, then exit. |
 | `--spoof TARGET GATEWAY [MORE_TARGETS...]` | Route traffic between the named targets and gateway through this computer while capturing it. The gateway is always the second address. |
 | `--all` or `-all` | Scan once, print all discovered IPs and the selected targets, then spoof up to 64 discovered clients. Your computer and the gateway are excluded. |
 
 The spoofing modes cannot be combined with `--scan`, and only one netwatch spoofing process can run at a time. Press **Ctrl+C** to stop. The program then sends the real ARP mappings to the targets and gateway and restores this computer's original IPv4 forwarding setting if it changed it.
+
+`--restrict-port` uses the **local source port** of outgoing TCP connections. To isolate one HTTPS test, start `sudo ./netwatch --restrict-port 45000`, then run `curl -q -4 --http1.1 --noproxy '*' --local-port 45000 https://example.com/`. Replies use local destination port 45000. Other new connections are rejected; existing connections, loopback, DNS on port 53, and essential IPv6 control traffic remain available. New inbound connections are rejected. The restriction applies to this computer's IPv4 and IPv6 traffic, not traffic forwarded for other devices. The log contains only TCP packets using the chosen local port. Temporary rules are removed on normal exit, Ctrl+C, or an unexpected capture-process exit. Existing firewall rules still apply.
+
+If both netwatch and its watcher are forcibly killed, remove the leftover restriction with `sudo nft delete table inet netwatch_port_lock`.
 
 During capture, netwatch prints a table roughly every ten seconds with `COUNT`, `WEBSITE`, `VISITOR IP`, and `LAST SEEN`. The visitor IP is the source IP of the packet containing the hostname. Rows are grouped by hostname and source IP; counts are hostname observations, including background app traffic, rather than confirmed page visits. The heading number is the number of distinct rows, and counts accumulate until the program exits.
 
