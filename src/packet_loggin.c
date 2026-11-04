@@ -109,6 +109,8 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec, unsigned port_fi
     size_t hdr = 0;
     const unsigned char *payload = NULL;
     size_t payload_len = 0;
+
+    // TCP HEADER
     if(proto == 6){
         hdr = (l4[12] >> 4) * 4;
         if(total < ihl + 20 || ihl + 14 + 20 > n) return;
@@ -170,9 +172,12 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec, unsigned port_fi
     if (payload_len > avail) payload_len = avail;
     if (proto == 6 && payload_len > 0) {
         char host[256];
-        if (extract_sni(payload, payload_len, host, sizeof host)){
+        int tls = tls_feed(ip + 12, ip + 16, rd16(l4), rd16(l4 + 2), rd32(l4 + 4), payload, payload_len, host, sizeof host);
+        if (tls == 1){
             fprintf(f, "Website: %s\n", host);
             host_seen(host, ip + 12);
+        } else if (tls == 2) {
+            fprintf(f, "ServerHello: %s\n", host);
         }
     }
 
