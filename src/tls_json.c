@@ -51,7 +51,8 @@ void tls_json_write(FILE *f, const struct tls_event *ev,
                 ev->data.alert.level, ev->data.alert.description);
         break;
     case TLS_ENCRYPTED_RECORD:
-        fprintf(f, ",\"event\":\"encrypted_record\",\"length\":%u", ev->length);
+        fprintf(f, ",\"event\":\"encrypted_record\",\"length\":%u,\"direction_bytes\":%llu,\"direction_records\":%llu",
+                ev->length, (unsigned long long)ev->total_bytes, (unsigned long long)ev->total_records);
         break;
     }
     if (synack_ms > 0) fprintf(f, ",\"syn_to_synack_ms\":%.3f", synack_ms);

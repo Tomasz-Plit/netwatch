@@ -19,6 +19,7 @@ struct flow {
     uint16_t client_port, server_port;
     time_t seen;
     struct stream dir[2];
+    uint64_t bytes[2], records[2];
 };
 static struct flow flows[MAX_FLOWS];
 
@@ -165,6 +166,26 @@ static struct flow *find_flow(const unsigned char *src, const unsigned char *dst
     return f;
 }
 
+static size_t pending_hello(struct stream *s, int direction,
+                            struct tls_event *events, size_t cap) {
+    size_t count = 0;
+    while (s->hs_used >= 4 && count < cap) {
+        size_t msg = ((size_t)s->handshake[1] << 16) | ((size_t)s->handshake[2] << 8) | s->handshake[3];
+        if (msg > BUFFER - 4) { s->hs_used = 0; break; }
+        if (s->hs_used < msg + 4) break;
+        struct tls_event *ev = &events[count];
+        memset(ev, 0, sizeof *ev);
+        ev->direction = direction;
+        if (s->handshake[0] == 1 && client_hello(s->handshake, msg + 4, &ev->data.client))
+            ev->type = TLS_CLIENT_HELLO, count++;
+        else if (s->handshake[0] == 2 && server_hello(s->handshake, msg + 4, &ev->data.server))
+            ev->type = TLS_SERVER_HELLO, count++;
+        memmove(s->handshake, s->handshake + msg + 4, s->hs_used - msg - 4);
+        s->hs_used -= msg + 4;
+    }
+    return count;
+}
+
 size_t tls_feed(const unsigned char *src, const unsigned char *dst,
                 uint16_t sport, uint16_t dport, uint32_t seq,
                 const unsigned char *payload, size_t len,
@@ -183,7 +204,7 @@ size_t tls_feed(const unsigned char *src, const unsigned char *dst,
     if (len) memcpy(s->bytes + s->used, payload, len);
     s->used += len;
     s->next_seq += (uint32_t)len;
-    size_t count = 0, pos = 0;
+    size_t count = pending_hello(s, direction, events, cap), pos = 0;
     while (count < cap && s->used - pos >= 5) {
         const unsigned char *r = s->bytes + pos;
         uint16_t size = rd16(r + 3);
@@ -196,25 +217,16 @@ size_t tls_feed(const unsigned char *src, const unsigned char *dst,
             if (size > BUFFER - s->hs_used) { f->active = 0; break; }
             memcpy(s->handshake + s->hs_used, r + 5, size);
             s->hs_used += size;
-            while (s->hs_used >= 4 && count < cap) {
-                size_t msg = ((size_t)s->handshake[1] << 16) | ((size_t)s->handshake[2] << 8) | s->handshake[3];
-                if (msg > BUFFER - 4) { f->active = 0; break; }
-                if (s->hs_used < msg + 4) break;
-                ev = &events[count]; memset(ev, 0, sizeof *ev);
-                ev->direction = direction;
-                if (s->handshake[0] == 1 && client_hello(s->handshake, msg + 4, &ev->data.client))
-                    ev->type = TLS_CLIENT_HELLO, count++;
-                else if (s->handshake[0] == 2 && server_hello(s->handshake, msg + 4, &ev->data.server))
-                    ev->type = TLS_SERVER_HELLO, count++;
-                memmove(s->handshake, s->handshake + msg + 4, s->hs_used - msg - 4);
-                s->hs_used -= msg + 4;
-            }
+            count += pending_hello(s, direction, events + count, cap - count);
         } else if (r[0] == 20 && size == 1 && r[5] == 1) {
             ev->type = TLS_CCS; count++;
         } else if (r[0] == 21 && size >= 2) {
             ev->type = TLS_ALERT; ev->data.alert.level = r[5]; ev->data.alert.description = r[6]; count++;
         } else if (r[0] == 23) {
-            ev->type = TLS_ENCRYPTED_RECORD; count++;
+            ev->type = TLS_ENCRYPTED_RECORD;
+            ev->total_bytes = (f->bytes[direction] += size);
+            ev->total_records = ++f->records[direction];
+            count++;
         }
         pos += 5 + size;
         if (!f->active) break;

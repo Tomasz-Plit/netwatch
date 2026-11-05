@@ -19,6 +19,7 @@ struct tls_event {
     enum tls_event_type type;
     int direction;
     uint16_t length;
+    uint64_t total_bytes, total_records;
     union {
         struct tls_client_hello client;
         struct tls_server_hello server;

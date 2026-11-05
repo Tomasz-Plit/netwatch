@@ -181,10 +181,11 @@ void log_packet(FILE *f, FILE *jsonf, const unsigned char *buf, ssize_t rec, uns
         struct tls_event events[8];
         size_t count;
         uint32_t next_seq = rd32(l4 + 4) + (uint32_t)payload_len;
+        size_t feed_len = payload_len;
         do {
             count = tls_feed(ip + 12, ip + 16, rd16(l4), rd16(l4 + 2),
-                             payload_len ? rd32(l4 + 4) : next_seq, payload, payload_len, events, 8);
-            payload_len = 0;
+                             feed_len ? rd32(l4 + 4) : next_seq, payload, feed_len, events, 8);
+            feed_len = 0;
             for (size_t i = 0; i < count; i++) {
                 struct tls_event *ev = &events[i];
                 switch (ev->type) {
