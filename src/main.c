@@ -187,10 +187,13 @@ int main(int argc, char *argv[]) {
     FILE *logfile = fopen("netwatch.log", "w");
     if (!logfile) { perror("fopen"); close(sockfd); return 1; }
     setvbuf(logfile, NULL, _IOLBF, 0);
+    FILE *jsonfile = fopen("netwatch_tls.jsonl", "w");
+    if (!jsonfile) { perror("fopen tls jsonl"); fclose(logfile); close(sockfd); return 1; }
+    setvbuf(jsonfile, NULL, _IOLBF, 0);
     int port_control = -1;
     pid_t port_watcher = -1;
     if (port_filter && !port_lock_start(port_filter, &port_control, &port_watcher)) {
-        fclose(logfile); close(sockfd); return 1;
+        fclose(jsonfile); fclose(logfile); close(sockfd); return 1;
     }
     if (port_filter) fprintf(stderr, "[port] outgoing TCP from local port %u allowed; DNS and existing connections remain available; Ctrl+C restores access\n", port_filter);
 
@@ -266,7 +269,7 @@ int main(int argc, char *argv[]) {
     while (running) {
         ssize_t rec = recieve_packet(sockfd, buffer, sizeof(buffer));
         if (rec < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) continue;
-        if (rec > 0) log_packet(logfile, buffer, rec, port_filter);
+        if (rec > 0) log_packet(logfile, jsonfile, buffer, rec, port_filter);
 
         time_t now = time(NULL);
         if (now - last_print > 10) { stats_print(stdout); last_print = now; }
@@ -284,6 +287,7 @@ int main(int argc, char *argv[]) {
         close(arp_sockfd);
     }
 
+    fclose(jsonfile);
     fclose(logfile);
     close(sockfd);
     if (port_filter && !port_lock_stop(port_control, port_watcher)) return 1;

@@ -13,18 +13,18 @@ int main(void) {
     frame[46] = 0x50; frame[47] = 0x18;
     FILE *out = tmpfile();
     assert(out);
-    log_packet(out, frame, sizeof frame, 45000);
+    log_packet(out, NULL, frame, sizeof frame, 45000);
     assert(ftell(out) > 0);
     fclose(out);
 
     out = tmpfile();
     assert(out);
     frame[35] = 0xc9; /* another local port: 45001 */
-    log_packet(out, frame, sizeof frame, 45000);
+    log_packet(out, NULL, frame, sizeof frame, 45000);
     assert(ftell(out) == 0);
     frame[35] = 0xc8;
     frame[23] = 17;
-    log_packet(out, frame, sizeof frame, 45000);
+    log_packet(out, NULL, frame, sizeof frame, 45000);
     assert(ftell(out) == 0);
     fclose(out);
     return 0;

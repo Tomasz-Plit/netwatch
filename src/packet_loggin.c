@@ -10,6 +10,9 @@
 #include <unistd.h>
 #include "../include/helpers.h"
 #include "../include/tls_parsing.h"
+#include "../include/tcp_track.h"
+#include "../include/tls_json.h"
+#include <time.h>
 #include "../include/quic_parsing.h"
 #include "../include/statistic.h"
 
@@ -69,7 +72,9 @@ static void print_macs(FILE *f, const unsigned char *buf){
 
 }
 
-void log_packet(FILE *f, const unsigned char *buf, ssize_t rec, unsigned port_filter){
+void log_packet(FILE *f, FILE *jsonf, const unsigned char *buf, ssize_t rec, unsigned port_filter){
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
     if(rec < 14) return;
     if(rd16(buf + 12) != 0x0800) {print_macs(f, buf); fprintf(f, "not an IPv4 \n\n"); return;}
     if(rec < 14 + 20) return;
@@ -106,6 +111,7 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec, unsigned port_fi
     fprintf(f, "\tFlags: DF:%d MF %d\n", df, mf);
     fprintf(f, "\tFragment offset %u (%u bytes)\n\n", frag_of, frag_of * 8);
 
+    struct tcp_conn *conn = NULL;
     size_t hdr = 0;
     const unsigned char *payload = NULL;
     size_t payload_len = 0;
@@ -121,6 +127,7 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec, unsigned port_fi
         uint32_t seq = rd32(l4+4);
         uint32_t ack = rd32(l4 + 8);
         uint8_t fl = l4[13];
+        conn = tcp_track(ip + 12, ip + 16, sport, dport, fl, &ts);
         uint16_t window = rd16(l4 + 14);
         uint16_t tcp_ck = rd16(l4 + 16);
         uint16_t urgent = rd16(l4+18);
@@ -171,14 +178,42 @@ void log_packet(FILE *f, const unsigned char *buf, ssize_t rec, unsigned port_fi
     size_t avail = (size_t)rec - 14 - ihl - hdr;
     if (payload_len > avail) payload_len = avail;
     if (proto == 6 && payload_len > 0) {
-        char host[256];
-        int tls = tls_feed(ip + 12, ip + 16, rd16(l4), rd16(l4 + 2), rd32(l4 + 4), payload, payload_len, host, sizeof host);
-        if (tls == 1){
-            fprintf(f, "Website: %s\n", host);
-            host_seen(host, ip + 12);
-        } else if (tls == 2) {
-            fprintf(f, "ServerHello: %s\n", host);
-        }
+        struct tls_event events[8];
+        size_t count;
+        uint32_t next_seq = rd32(l4 + 4) + (uint32_t)payload_len;
+        do {
+            count = tls_feed(ip + 12, ip + 16, rd16(l4), rd16(l4 + 2),
+                             payload_len ? rd32(l4 + 4) : next_seq, payload, payload_len, events, 8);
+            payload_len = 0;
+            for (size_t i = 0; i < count; i++) {
+                struct tls_event *ev = &events[i];
+                switch (ev->type) {
+                case TLS_CLIENT_HELLO:
+                    fprintf(f, "TLS ClientHello: SNI %s\n", ev->data.client.sni);
+                    if (ev->data.client.sni[0]) host_seen(ev->data.client.sni, ip + 12);
+                    tcp_track_hello(conn, &ts, 0);
+                    break;
+                case TLS_SERVER_HELLO:
+                    tcp_track_hello(conn, &ts, 1);
+                    fprintf(f, "TLS ServerHello: version 0x%04x, cipher 0x%04x\n",
+                            ev->data.server.version ? ev->data.server.version : ev->data.server.legacy_version,
+                            ev->data.server.cipher);
+                    break;
+                case TLS_CCS: fprintf(f, "TLS ChangeCipherSpec\n"); break;
+                case TLS_ALERT:
+                    fprintf(f, "TLS Alert: level %u, description %u\n",
+                            ev->data.alert.level, ev->data.alert.description);
+                    break;
+                case TLS_ENCRYPTED_RECORD:
+                    fprintf(f, "TLS encrypted record: %u bytes (%s)\n", ev->length,
+                            ev->direction ? "server to client" : "client to server");
+                    break;
+                }
+                tls_json_write(jsonf, ev, ip + 12, ip + 16, rd16(l4), rd16(l4 + 2),
+                               &ts, conn ? conn->synack_ms : 0,
+                               conn ? conn->hello_server_ms : 0);
+            }
+        } while (count == 8);
     }
 
     if (proto == 17 && payload_len > 0 && rd16(l4 + 2) == 443) {
