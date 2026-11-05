@@ -2,3 +2,4 @@ netwatch
 netwatch.log
 test_keys
 *.swp
+netwatch_tls.jsonl
