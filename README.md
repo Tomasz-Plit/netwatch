@@ -49,14 +49,16 @@ Packet details and short hex/ASCII payload dumps go to `netwatch.log` in the cur
 
 1. **Discovery:** ARP asks which device owns each usable IPv4 address on the local subnet. Replies supply IP and MAC address pairs. A device that does not reply during the scan will not appear.
 2. **Spoofing:** For each target, netwatch tells the target that the gateway IP is at this computer's MAC address and tells the gateway that the target IP is at this computer's MAC address. Linux IPv4 forwarding passes the intercepted packets onward. The program repeats these ARP replies about every two seconds.
-3. **Capture:** A Linux `AF_PACKET` raw socket receives Ethernet frames on the chosen interface. The parser reads IPv4 and TCP or UDP headers.
+3. **Capture:** A Linux `AF_PACKET` raw socket receives Ethernet frames on the chosen interface. The parser reads IPv4 and IPv6 headers and TCP or UDP headers. IPv6 extension headers are inspected where supported; fragmented IPv6 packets are skipped.
 4. **Hostnames:** For TCP, it looks for the Server Name Indication (SNI) in a TLS ClientHello. For UDP port 443, it derives QUIC version 1 Initial keys, decrypts Initial packets, and looks for the ClientHello hostname. OpenSSL's `libcrypto` supplies the cryptographic functions.
-5. **Statistics:** It records each hostname with the packet's source IPv4 address, updates its count and last-seen time, and prints the table periodically.
+5. **Statistics:** It records each hostname with the packet's source IP address, updates its count and last-seen time, and prints the table periodically.
 
 The main implementation is in `src/main.c`. `tests/test_hd.c` and `tests/test_keys.c` are small standalone QUIC experiments; the Makefile builds only `netwatch`.
 
 ## Limits
 
+- IPv6 capture covers packets visible on the selected interface. Discovery and spoofing use ARP and remain IPv4-only.
+
 - A scan finds responding devices on the local IPv4 subnet, not necessarily every device connected to Wi-Fi. `--all` uses only the results of its startup scan; it does not add devices later.
-- The hostname table is incomplete by design. It does not reveal URLs or encrypted page contents. TLS handshakes split across TCP packets, unsupported QUIC versions, encrypted ClientHello, VPNs, and IPv6 traffic may not produce a hostname. QUIC ClientHello assembly tracks one connection at a time.
+- The hostname table is incomplete by design. It does not reveal URLs or encrypted page contents. Out-of-order TLS segments, unsupported QUIC versions, encrypted ClientHello, VPNs, and fragmented IPv6 traffic may not produce a hostname. QUIC ClientHello assembly tracks one connection at a time.
 - A crash or forced termination can skip ARP and forwarding cleanup. Normal cleanup runs when you press Ctrl+C.
