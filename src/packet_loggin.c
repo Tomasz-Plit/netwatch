@@ -76,40 +76,52 @@ void log_packet(FILE *f, FILE *jsonf, const unsigned char *buf, ssize_t rec, uns
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     if(rec < 14) return;
-    if(rd16(buf + 12) != 0x0800) {print_macs(f, buf); fprintf(f, "not an IPv4 \n\n"); return;}
-    if(rec < 14 + 20) return;
     size_t n = (size_t)rec;
-    const unsigned char *ip = buf + 14;
-    size_t ihl = (ip[0] & 0x0f) * 4;
-    uint16_t total = rd16(ip + 2);
-    uint8_t proto = ip[9];
-    uint16_t id = rd16(ip + 4);
-    uint16_t check_sum = rd16(ip + 10);
-    uint16_t flags = rd16(ip + 6);
-    int df = (flags >> 14) & 1;
-    int mf = (flags >> 13) & 1;
-    uint16_t frag_of = flags & 0x1FFF;
-    const unsigned char *l4 = ip + ihl;
-    if(ihl < 20 || n < 14 + ihl) return;
-
-    if(proto == 6 && frag_of == 0){
-        if(total < ihl + 20 || n < 14 + ihl + 20) return;
-        size_t thdr = (l4[12] >> 4) * 4;
-        if(thdr < 20 || ihl + thdr > total || 14 + ihl + thdr > n) return;
-        if(total == ihl + thdr && !(l4[13] & 0x07)) return;
+    const unsigned char *ip = buf + 14, *src, *dst;
+    size_t ihl, total;
+    uint8_t proto;
+    int family;
+    uint16_t frag_of;
+    if (rd16(buf + 12) == 0x0800) {
+        if (n < 34 || (ip[0] >> 4) != 4) return;
+        family = AF_INET; ihl = (ip[0] & 15) * 4; total = rd16(ip + 2);
+        if (ihl < 20 || n < 14 + ihl || total < ihl) return;
+        proto = ip[9]; src = ip + 12; dst = ip + 16;
+        frag_of = rd16(ip + 6) & 0x1fff;
+        if (frag_of || (rd16(ip + 6) & 0x2000)) return;
+    } else if (rd16(buf + 12) == 0x86dd) {
+        if (n < 54 || (ip[0] >> 4) != 6) return;
+        family = AF_INET6; ihl = 40; total = 40 + rd16(ip + 4);
+        if (total == 40) return; /* IPv6 jumbograms are not supported. */
+        proto = ip[6]; src = ip + 8; dst = ip + 24;
+        while (proto == 0 || proto == 43 || proto == 60 || proto == 51) {
+            if (ihl + 2 > total || 14 + ihl + 2 > n) return;
+            size_t ext = proto == 51 ? (ip[ihl + 1] + 2u) * 4 : (ip[ihl + 1] + 1u) * 8;
+            if (ext < 8 || ext > total - ihl || ext > n - 14 - ihl) return;
+            proto = ip[ihl]; ihl += ext;
+        }
+        if (proto == 44) return; /* Fragment reassembly is not supported. */
+    } else {
+        if (!port_filter) { print_macs(f, buf); fprintf(f, "not an IP packet\n\n"); }
+        return;
     }
-    if (port_filter && (proto != 6 || frag_of != 0 ||
-        (rd16(l4) != port_filter && rd16(l4 + 2) != port_filter))) return;
-
+    const unsigned char *l4 = ip + ihl;
+    size_t available = n - 14 - ihl;
+    size_t ip_payload = total - ihl;
+    if (proto == 6) {
+        if (ip_payload < 20 || available < 20) return;
+        size_t thdr = (l4[12] >> 4) * 4;
+        if (thdr < 20 || thdr > ip_payload || thdr > available) return;
+        if (ip_payload == thdr && !(l4[13] & 0x07)) return;
+    }
+    if (port_filter && (proto != 6 || (rd16(l4) != port_filter && rd16(l4 + 2) != port_filter))) return;
+    char src_text[INET6_ADDRSTRLEN], dst_text[INET6_ADDRSTRLEN];
+    if (!inet_ntop(family, src, src_text, sizeof src_text) ||
+        !inet_ntop(family, dst, dst_text, sizeof dst_text)) return;
     print_macs(f, buf);
-    fprintf(f, "IP Header: IPv4\n\t");
-    fprintf(f, "Header length: %ld\n \tTotal length: %u\n \tTTL: %u\n \tProtocol: %u\n",
-        ihl, total, ip[8], proto);
-    fprintf(f, "\tid: %u\n \tcheck_sum: %u\n", id, check_sum);
-    fprintf(f, "\tSrc IP: %u.%u.%u.%u \n", ip[12], ip[13], ip[14], ip[15]);
-    fprintf(f, "\tDst IP: %u.%u.%u.%u \n", ip[16], ip[17], ip[18], ip[19]);
-    fprintf(f, "\tFlags: DF:%d MF %d\n", df, mf);
-    fprintf(f, "\tFragment offset %u (%u bytes)\n\n", frag_of, frag_of * 8);
+    fprintf(f, "IP Header: IPv%d\n\tHeader length: %zu\n \tTotal length: %zu\n \t%s: %u\n \tProtocol: %u\n\tSrc IP: %s\n\tDst IP: %s\n",
+            family == AF_INET ? 4 : 6, ihl, total, family == AF_INET ? "TTL" : "Hop Limit",
+            family == AF_INET ? ip[8] : ip[7], proto, src_text, dst_text);
 
     struct tcp_conn *conn = NULL;
     size_t hdr = 0;
@@ -127,7 +139,7 @@ void log_packet(FILE *f, FILE *jsonf, const unsigned char *buf, ssize_t rec, uns
         uint32_t seq = rd32(l4+4);
         uint32_t ack = rd32(l4 + 8);
         uint8_t fl = l4[13];
-        conn = tcp_track(ip + 12, ip + 16, sport, dport, fl, &ts);
+        conn = tcp_track_ip(family, src, dst, sport, dport, fl, &ts);
         uint16_t window = rd16(l4 + 14);
         uint16_t tcp_ck = rd16(l4 + 16);
         uint16_t urgent = rd16(l4+18);
@@ -183,7 +195,7 @@ void log_packet(FILE *f, FILE *jsonf, const unsigned char *buf, ssize_t rec, uns
         uint32_t next_seq = rd32(l4 + 4) + (uint32_t)payload_len;
         size_t feed_len = payload_len;
         do {
-            count = tls_feed(ip + 12, ip + 16, rd16(l4), rd16(l4 + 2),
+            count = tls_feed_ip(family, src, dst, rd16(l4), rd16(l4 + 2),
                              feed_len ? rd32(l4 + 4) : next_seq, payload, feed_len, events, 8);
             feed_len = 0;
             for (size_t i = 0; i < count; i++) {
@@ -191,7 +203,7 @@ void log_packet(FILE *f, FILE *jsonf, const unsigned char *buf, ssize_t rec, uns
                 switch (ev->type) {
                 case TLS_CLIENT_HELLO:
                     fprintf(f, "TLS ClientHello: SNI %s\n", ev->data.client.sni);
-                    if (ev->data.client.sni[0]) host_seen(ev->data.client.sni, ip + 12);
+                    if (ev->data.client.sni[0]) host_seen_ip(ev->data.client.sni, family, src);
                     tcp_track_hello(conn, &ts, 0);
                     break;
                 case TLS_SERVER_HELLO:
@@ -210,7 +222,7 @@ void log_packet(FILE *f, FILE *jsonf, const unsigned char *buf, ssize_t rec, uns
                             ev->direction ? "server to client" : "client to server");
                     break;
                 }
-                tls_json_write(jsonf, ev, ip + 12, ip + 16, rd16(l4), rd16(l4 + 2),
+                tls_json_write_ip(jsonf, ev, family, src, dst, rd16(l4), rd16(l4 + 2),
                                &ts, conn ? conn->synack_ms : 0,
                                conn ? conn->hello_server_ms : 0);
             }
@@ -241,7 +253,7 @@ void log_packet(FILE *f, FILE *jsonf, const unsigned char *buf, ssize_t rec, uns
                     char host[256];
                     if (quic_find_sni(plain, plain_len, q.dcid, q.dcid_len, host, sizeof host)){
                         fprintf(f, "Website (QUIC): %s\n", host);
-                        host_seen(host, ip + 12);
+                        host_seen_ip(host, family, src);
                     }
                 }
                 else {

@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 
+void host_seen_ip(const char *name, int family, const unsigned char *ip);
 void host_seen(const char *name, const unsigned char *ip);
 void stats_print(FILE *out);
 

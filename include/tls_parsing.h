@@ -29,6 +29,7 @@ struct tls_event {
 
 int extract_sni_hs(const unsigned char *p, size_t len, char *out, size_t outsz);
 int extract_sni(const unsigned char *p, size_t len, char *out, size_t outsz);
+size_t tls_feed_ip(int family, const unsigned char *src, const unsigned char *dst, uint16_t sport, uint16_t dport, uint32_t seq, const unsigned char *payload, size_t len, struct tls_event *events, size_t cap);
 size_t tls_feed(const unsigned char *src_ip, const unsigned char *dst_ip,
                 uint16_t src_port, uint16_t dst_port, uint32_t seq,
                 const unsigned char *payload, size_t payload_len,

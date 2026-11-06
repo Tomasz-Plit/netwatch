@@ -1,4 +1,5 @@
 #include "../include/tls_json.h"
+#include <arpa/inet.h>
 
 static void string(FILE *f, const char *s) {
     fputc('"', f);
@@ -14,15 +15,15 @@ static void list(FILE *f, const char *name, const uint16_t *items, size_t n) {
     for (size_t i = 0; i < n; i++) fprintf(f, "%s\"0x%04x\"", i ? "," : "", items[i]);
     fputc(']', f);
 }
-void tls_json_write(FILE *f, const struct tls_event *ev,
+void tls_json_write_ip(FILE *f, const struct tls_event *ev, int family,
                     const unsigned char *src, const unsigned char *dst,
                     uint16_t sport, uint16_t dport, const struct timespec *ts,
                     double synack_ms, double hello_server_ms) {
     if (!f) return;
-    fprintf(f, "{\"ts\":%lld.%09ld,\"src\":\"%u.%u.%u.%u\",\"dst\":\"%u.%u.%u.%u\",\"sport\":%u,\"dport\":%u,\"dir\":\"%s\"",
-            (long long)ts->tv_sec, ts->tv_nsec,
-            src[0], src[1], src[2], src[3], dst[0], dst[1], dst[2], dst[3],
-            sport, dport, ev->direction ? "s2c" : "c2s");
+    char src_text[INET6_ADDRSTRLEN], dst_text[INET6_ADDRSTRLEN];
+    if (!inet_ntop(family, src, src_text, sizeof src_text) || !inet_ntop(family, dst, dst_text, sizeof dst_text)) return;
+    fprintf(f, "{\"ts\":%lld.%09ld,\"src\":\"%s\",\"dst\":\"%s\",\"sport\":%u,\"dport\":%u,\"dir\":\"%s\"",
+            (long long)ts->tv_sec, ts->tv_nsec, src_text, dst_text, sport, dport, ev->direction ? "s2c" : "c2s");
     switch (ev->type) {
     case TLS_CLIENT_HELLO: {
         const struct tls_client_hello *c = &ev->data.client;
@@ -59,3 +60,5 @@ void tls_json_write(FILE *f, const struct tls_event *ev,
     if (hello_server_ms > 0) fprintf(f, ",\"client_to_server_hello_ms\":%.3f", hello_server_ms);
     fputs("}\n", f);
 }
+
+void tls_json_write(FILE *f, const struct tls_event *ev, const unsigned char *src, const unsigned char *dst, uint16_t sport, uint16_t dport, const struct timespec *ts, double synack_ms, double hello_server_ms) { tls_json_write_ip(f, ev, AF_INET, src, dst, sport, dport, ts, synack_ms, hello_server_ms); }

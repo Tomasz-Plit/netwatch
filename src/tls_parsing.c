@@ -1,6 +1,7 @@
 #include "../include/tls_parsing.h"
 #include "../include/helpers.h"
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
 
 #define MAX_FLOWS 64
@@ -15,7 +16,8 @@ struct stream {
 };
 struct flow {
     int active;
-    unsigned char client[4], server[4];
+    int family;
+    unsigned char client[16], server[16];
     uint16_t client_port, server_port;
     time_t seen;
     struct stream dir[2];
@@ -143,7 +145,7 @@ static int server_hello(const unsigned char *p, size_t n, struct tls_server_hell
     return 1;
 }
 
-static struct flow *find_flow(const unsigned char *src, const unsigned char *dst,
+static struct flow *find_flow(int family, const unsigned char *src, const unsigned char *dst,
                               uint16_t sport, uint16_t dport, int *direction) {
     time_t now = time(NULL);
     struct flow *free_slot = NULL, *oldest = &flows[0];
@@ -152,15 +154,17 @@ static struct flow *find_flow(const unsigned char *src, const unsigned char *dst
         if (f->active && now - f->seen > IDLE_SECONDS) f->active = 0;
         if (!f->active) { if (!free_slot) free_slot = f; continue; }
         if (f->seen < oldest->seen) oldest = f;
-        if (!memcmp(f->client, src, 4) && !memcmp(f->server, dst, 4) &&
+        if (f->family != family) continue;
+        if (!memcmp(f->client, src, family == AF_INET ? 4 : 16) && !memcmp(f->server, dst, family == AF_INET ? 4 : 16) &&
             f->client_port == sport && f->server_port == dport) { *direction = 0; f->seen = now; return f; }
-        if (!memcmp(f->server, src, 4) && !memcmp(f->client, dst, 4) &&
+        if (!memcmp(f->server, src, family == AF_INET ? 4 : 16) && !memcmp(f->client, dst, family == AF_INET ? 4 : 16) &&
             f->server_port == sport && f->client_port == dport) { *direction = 1; f->seen = now; return f; }
     }
     struct flow *f = free_slot ? free_slot : oldest;
     memset(f, 0, sizeof *f);
     f->active = 1; f->seen = now;
-    memcpy(f->client, src, 4); memcpy(f->server, dst, 4);
+    f->family = family;
+    memcpy(f->client, src, family == AF_INET ? 4 : 16); memcpy(f->server, dst, family == AF_INET ? 4 : 16);
     f->client_port = sport; f->server_port = dport;
     *direction = 0;
     return f;
@@ -186,13 +190,13 @@ static size_t pending_hello(struct stream *s, int direction,
     return count;
 }
 
-size_t tls_feed(const unsigned char *src, const unsigned char *dst,
+size_t tls_feed_ip(int family, const unsigned char *src, const unsigned char *dst,
                 uint16_t sport, uint16_t dport, uint32_t seq,
                 const unsigned char *payload, size_t len,
                 struct tls_event *events, size_t cap) {
     if (!cap) return 0;
     int direction;
-    struct flow *f = find_flow(src, dst, sport, dport, &direction);
+    struct flow *f = find_flow(family, src, dst, sport, dport, &direction);
     struct stream *s = &f->dir[direction];
     if (!s->seq_set) { s->next_seq = seq; s->seq_set = 1; }
     if (seq != s->next_seq) {
@@ -235,3 +239,5 @@ size_t tls_feed(const unsigned char *src, const unsigned char *dst,
     s->used -= pos;
     return count;
 }
+
+size_t tls_feed(const unsigned char *src, const unsigned char *dst, uint16_t sport, uint16_t dport, uint32_t seq, const unsigned char *payload, size_t len, struct tls_event *events, size_t cap) { return tls_feed_ip(AF_INET, src, dst, sport, dport, seq, payload, len, events, cap); }
