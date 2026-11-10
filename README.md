@@ -8,11 +8,32 @@ Use spoofing only on networks and devices you own or are authorized to inspect. 
 
 You need Linux, `gcc`, `make`, and the OpenSSL development headers and library (`libcrypto`). Raw packet sockets and changes to IPv4 forwarding require root privileges. The port restriction also needs `nft` and permission to manage firewall rules.
 
-The interface name is currently set to `wlp0s20f3` in `IFNAME` near the top of `src/main.c`. Check yours with `ip -4 addr show`, change `IFNAME` if needed, then build:
+Netwatch automatically selects the first active default IPv4 route. Build it with:
 
 ```sh
 make
 ```
+
+To launch the desktop app, also install Python 3, Tkinter and `pkexec`, then run:
+
+```sh
+make app
+```
+
+On Fedora, the Tkinter package is `python3-tkinter`. Click **Start capture**
+and authorize the request. The app runs as your normal user; a privileged helper
+starts only the existing capture program. **Stop** ends the capture. This mode
+captures on your computer and does not use ARP spoofing. The app's capture files
+are temporary and do not overwrite CLI logs. Use the CLI separately if you
+want to keep its logs.
+
+The dashboard shows interface download and upload rates, grouped TLS
+handshakes, and observed TLS hostnames. Click a category to filter the website
+list and select a handshake to see its ClientHello and ServerHello details.
+Categories use a small offline domain list in `app/model.py`; unknown domains
+are **Other**. They count observations, not visits or time spent. The app reads
+the existing TLS JSON file, so its website list does not include QUIC hostnames.
+Interface traffic rates include all traffic on that interface, not only TLS.
 
 Run the automated tests with `make test`. They require no root privileges or
 network access. The port-lock integration test requires a separate network
