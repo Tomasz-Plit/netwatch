@@ -14,6 +14,11 @@ The interface name is currently set to `wlp0s20f3` in `IFNAME` near the top of `
 make
 ```
 
+Run the automated tests with `make test`. They require no root privileges or
+network access. The port-lock integration test requires a separate network
+namespace and is not included; `test_hd.c` and `test_keys.c` are standalone
+QUIC experiments rather than automated tests.
+
 ## Usage
 
 ```sh
@@ -53,7 +58,7 @@ Packet details and short hex/ASCII payload dumps go to `netwatch.log` in the cur
 4. **Hostnames:** For TCP, it looks for the Server Name Indication (SNI) in a TLS ClientHello. For UDP port 443, it derives QUIC version 1 Initial keys, decrypts Initial packets, and looks for the ClientHello hostname. OpenSSL's `libcrypto` supplies the cryptographic functions.
 5. **Statistics:** It records each hostname with the packet's source IP address, updates its count and last-seen time, and prints the table periodically.
 
-The main implementation is in `src/main.c`. `tests/test_hd.c` and `tests/test_keys.c` are small standalone QUIC experiments; the Makefile builds only `netwatch`.
+The main implementation is in `src/main.c`.
 
 ## Limits
 
