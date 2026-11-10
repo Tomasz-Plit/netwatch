@@ -3,3 +3,4 @@ netwatch.log
 test_keys
 *.swp
 netwatch_tls.jsonl
+__pycache__/

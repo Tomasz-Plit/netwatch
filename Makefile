@@ -7,7 +7,10 @@ SOURCES = src/main.c src/arp_parsing.c src/helpers.c src/packet_loggin.c \
 netwatch: $(SOURCES) $(wildcard include/*.h)
 	$(CC) $(CFLAGS) $(SOURCES) -o $@ -lcrypto
 
-.PHONY: test test-shutdown
+.PHONY: app test test-shutdown
+app: netwatch
+	python3 app/main.py
+
 test: test-shutdown
 	@set -eu; dir=$$(mktemp -d); trap 'rm -rf "$$dir"' EXIT; \
 	for name in test_ipv6 test_port_filter test_tls_flow test_tls_metadata; do \
@@ -15,6 +18,7 @@ test: test-shutdown
 		"$$dir/$$name"; \
 		echo "$$name passed"; \
 	done
+	python3 -m unittest discover -s app -p 'test_*.py'
 
 test-shutdown:
 	$(CC) $(CFLAGS) -Dmain=netwatch_main -c src/main.c -o /tmp/netwatch-test-main.o
