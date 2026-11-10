@@ -16,9 +16,11 @@
 #include "../include/packet_logging.h"
 #include "../include/port_lock.h"
 #include "../include/statistic.h"
+#include "../include/helpers.h"
 
-#define IFNAME "wlp0s20f3"
+//#define IFNAME "wlp0s20f3"
 #define MAX_SCAN_HOSTS 4096
+char ifname[IFNAMSIZ] = {0};
 
 int main(int argc, char *argv[]) {
     int do_spoof = 0;
@@ -36,6 +38,11 @@ int main(int argc, char *argv[]) {
     int forwarding_state_saved = 0;
     int spoof_lock_fd = -1;
 
+    if(!find_default_interface(ifname)){
+        fprintf(stderr, "Could not detect a default network interface");
+        return 1;
+    }
+    printf("Detected interface: %s\n", ifname);
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-all") == 0 || strcmp(argv[i], "--all") == 0) {
             do_all = 1;
@@ -88,19 +95,19 @@ int main(int argc, char *argv[]) {
     }
 
     if (do_discover) {
-        int ifindex = (int)if_nametoindex(IFNAME);
-        if (ifindex == 0) { fprintf(stderr, "unknown interface: %s\n", IFNAME); return 1; }
+        int ifindex = (int)if_nametoindex(ifname);
+        if (ifindex == 0) { fprintf(stderr, "unknown interface: %s\n", ifname); return 1; }
         struct discovered_host found[MAX_SCAN_HOSTS];
-        return discover_hosts(IFNAME, ifindex, found, MAX_SCAN_HOSTS) < 0 ? 1 : 0;
+        return discover_hosts(ifname, ifindex, found, MAX_SCAN_HOSTS) < 0 ? 1 : 0;
     }
 
     if (do_all) {
-        int ifindex = (int)if_nametoindex(IFNAME);
+        int ifindex = (int)if_nametoindex(ifname);
         unsigned char our_ip[4], gateway_ip[4];
         struct discovered_host found[MAX_SCAN_HOSTS];
-        if (ifindex == 0) { fprintf(stderr, "unknown interface: %s\n", IFNAME); return 1; }
-        if (!get_own_ip(IFNAME, our_ip) || !get_default_gateway(IFNAME, gateway_ip)) return 1;
-        int found_count = discover_hosts(IFNAME, ifindex, found, MAX_SCAN_HOSTS);
+        if (ifindex == 0) { fprintf(stderr, "unknown interface: %s\n", ifname); return 1; }
+        if (!get_own_ip(ifname, our_ip) || !get_default_gateway(ifname, gateway_ip)) return 1;
+        int found_count = discover_hosts(ifname, ifindex, found, MAX_SCAN_HOSTS);
         if (found_count < 0) return 1;
         for (int i = 0; i < found_count; i++) {
             if (memcmp(found[i].ip, our_ip, 4) == 0) continue;
@@ -174,7 +181,7 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
 
-    int sockfd = open_raw_socket(IFNAME);
+    int sockfd = open_raw_socket(ifname);
     if (sockfd == -1) return 1;
     struct timeval receive_timeout = { .tv_sec = 1, .tv_usec = 0 };
     if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,
@@ -182,7 +189,7 @@ int main(int argc, char *argv[]) {
         perror("setsockopt (capture timeout)"); close(sockfd); return 1;
     }
 
-    int ifindex = (int)if_nametoindex(IFNAME);
+    int ifindex = (int)if_nametoindex(ifname);
     FILE *logfile = fopen("netwatch.log", "w");
     if (!logfile) { perror("fopen"); close(sockfd); return 1; }
     setvbuf(logfile, NULL, _IOLBF, 0);
@@ -206,7 +213,7 @@ int main(int argc, char *argv[]) {
 
         unsigned char our_mac[6], our_ip[4], gateway_ip[4], gateway_mac[6];
         if (!parse_ipv4(gateway_ip_str, gateway_ip) ||
-            !get_own_mac(IFNAME, our_mac) || !get_own_ip(IFNAME, our_ip)) return 1;
+            !get_own_mac(ifname, our_mac) || !get_own_ip(ifname, our_ip)) return 1;
 
         fprintf(stderr, "[arp] our MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
                 our_mac[0], our_mac[1], our_mac[2], our_mac[3], our_mac[4], our_mac[5]);
@@ -264,10 +271,14 @@ int main(int argc, char *argv[]) {
     unsigned char buffer[65535];
     time_t last_print = time(NULL);
     time_t last_spoof = time(NULL);
+    int capture_failed = 0;
 
     while (running) {
         ssize_t rec = recieve_packet(sockfd, buffer, sizeof(buffer));
-        if (rec < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) continue;
+        if (rec < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR){
+            capture_failed = 1;
+            break;
+        }
         if (rec > 0) log_packet(logfile, jsonfile, buffer, rec, port_filter);
 
         time_t now = time(NULL);
@@ -291,6 +302,10 @@ int main(int argc, char *argv[]) {
     close(sockfd);
     if (port_filter && !port_lock_stop(port_control, port_watcher)) return 1;
     if (spoof_lock_fd >= 0) close(spoof_lock_fd);
+    if(capture_failed){
+        fprintf(stderr, "[netwatch] capture failed; cleanup completed");
+        return 1;
+    }
     fprintf(stderr, "[netwatch] clean shutdown\n");
     return 0;
 }

@@ -38,8 +38,11 @@ ssize_t recieve_packet(int sockfd, unsigned char *buf, size_t size){
     ssize_t rec = recvfrom(
         sockfd, buf, size, 0, NULL, NULL
     );
-    if (rec == -1 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+    if (rec == -1 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR){
+        int saved_errno = errno;
         perror("recvfrom");
+        errno = saved_errno;
+    }
     return rec;
 }
 
