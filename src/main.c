@@ -172,15 +172,14 @@ int main(int argc, char *argv[]) {
     }
 
     signal(SIGINT, sigint_handler);
+    signal(SIGTERM, sigint_handler);
 
     int sockfd = open_raw_socket(IFNAME);
     if (sockfd == -1) return 1;
-    if (do_spoof || port_filter) {
-        struct timeval receive_timeout = { .tv_sec = 1, .tv_usec = 0 };
-        if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,
-                       &receive_timeout, sizeof receive_timeout) < 0) {
-            perror("setsockopt (capture timeout)"); close(sockfd); return 1;
-        }
+    struct timeval receive_timeout = { .tv_sec = 1, .tv_usec = 0 };
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,
+                    &receive_timeout, sizeof receive_timeout) < 0) {
+        perror("setsockopt (capture timeout)"); close(sockfd); return 1;
     }
 
     int ifindex = (int)if_nametoindex(IFNAME);
