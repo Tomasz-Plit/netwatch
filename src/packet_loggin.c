@@ -4,6 +4,7 @@
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <net/if.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -232,7 +233,7 @@ void log_packet(FILE *f, FILE *jsonf, const unsigned char *buf, ssize_t rec, uns
         } while (count == 8);
     }
 
-    if (proto == 17 && payload_len > 0 && rd16(l4 + 2) == 443) {
+    if (proto == 17 && payload_len > 0 && (rd16(l4 + 2) == 443 || rd16(l4) == 443)) {
         struct quic_initial q;
         if (parse_quic_initial(payload, payload_len, &q)) {
             fprintf(f, "QUIC Initial: version %u, DCID length %zu, length field %llu\n",
@@ -242,7 +243,20 @@ void log_packet(FILE *f, FILE *jsonf, const unsigned char *buf, ssize_t rec, uns
             unsigned char first;
             size_t pn_len;
             uint32_t pn;
-            if (derive_initial_keys(q.dcid, q.dcid_len, &k) &&
+            int is_server = (rd16(l4) == 443 && rd16(l4 + 2) != 443);
+            const unsigned char *key_dcid = NULL;
+            size_t key_dcid_len = 0;
+            if (is_server){
+                struct ch *slot = quic_server_slot(&q);
+                if(slot != NULL){
+                    key_dcid = slot->dcid;
+                    key_dcid_len = slot->dcid_len;
+                }
+            } else{
+                key_dcid = q.dcid;
+                key_dcid_len = q.dcid_len;
+            }
+            if (key_dcid != NULL && derive_initial_keys(key_dcid, key_dcid_len, is_server, &k) &&
                 quic_unprotect_header(payload, payload_len, &q, k.hp, &first, &pn_len, &pn)) {
                 fprintf(f, "\tfirst byte 0x%02x, packet number %u (%zu bytes)\n",
                         first, pn, pn_len);
@@ -251,13 +265,23 @@ void log_packet(FILE *f, FILE *jsonf, const unsigned char *buf, ssize_t rec, uns
                 size_t plain_len = 0;
                 if (quic_decrypt_initial(payload, payload_len, &q, &k, first, pn_len, pn,
                                          plain, sizeof plain, &plain_len)) {
-                    fprintf(f, "\tQUIC decrypted: %zu bytes of frames\n", plain_len);
+                    if(is_server) fprintf(f, "\tQUIC server Initial decrypted: %zu bytes\n", plain_len);
+                    else fprintf(f, "\tQUIC client Initial decrypted: %zu bytes\n", plain_len);
                     print_payload(f, plain, plain_len);
-                    char host[256];
-                    if (quic_find_sni(plain, plain_len, q.dcid, q.dcid_len, host, sizeof host)){
-                        fprintf(f, "Website (QUIC): %s\n", host);
-                        host_seen_ip(host, family, src);
-                        hostname_json_write(jsonf, host, family, src, dst, rd16(l4), rd16(l4 + 2), &ts);
+                    if(!is_server){
+                        char host[256];
+                        int found_sni = quic_find_sni(plain, plain_len, q.dcid, q.dcid_len, host, sizeof host);
+                        quic_client_slot(&q);
+                        if (found_sni){
+                            fprintf(f, "Website (QUIC): %s\n", host);
+                            host_seen_ip(host, family, src);
+                            hostname_json_write(jsonf, host, family, src, dst, rd16(l4), rd16(l4 + 2), &ts);
+                        }
+                    } else{
+                        struct tls_server_hello hello;
+                        if(quic_find_server_hello(plain, plain_len, &q, &hello)){
+                            fprintf(f, "QUIC ServerHello: version 0x%04x, cipher 0x%04x\n", hello.version ? hello.version : hello.legacy_version, hello.cipher);
+                        }
                     }
                 }
                 else {

@@ -1,19 +1,36 @@
 #include "../include/quic_parsing.h"
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include <stddef.h>
 #include <string.h>
 #include "../include/helpers.h"
 #include "../include/tls_parsing.h"
 
 #define CH_MAX 4096
+#define MAX_FLOWS 64
 
-static struct {
-    unsigned char dcid[20];
-    size_t dcid_len;
-    unsigned char data[CH_MAX];
-    unsigned char have[CH_MAX];
-    int done;
-} ch;
+static struct ch quic_flows[MAX_FLOWS];
+
+struct ch *quic_client_slot(const struct quic_initial *q){
+    struct ch *slot = NULL;
+    for(int i = 0; i < MAX_FLOWS; i++){
+        if (quic_flows[i].active && quic_flows[i].dcid_len == q->dcid_len && memcmp(quic_flows[i].dcid, q->dcid, q->dcid_len) == 0){
+            slot = &quic_flows[i];
+            slot->scid_len = q->scid_len;
+            memcpy(slot->scid, q->scid, q->scid_len);
+            return slot;
+        }
+    }
+    return NULL;
+}
+
+struct ch *quic_server_slot(const struct quic_initial *q){
+    if (q->dcid_len == 0 || q->dcid_len > 20) return NULL;
+    for(int i = 0; i < MAX_FLOWS; i++){
+        if(quic_flows[i].active && quic_flows[i].scid_len == q->dcid_len && memcmp(quic_flows[i].scid, q->dcid, q->dcid_len) == 0) return &quic_flows[i];
+    }
+    return NULL;
+}
 
 static int read_variant(const unsigned char *p, size_t len, size_t *pos, uint64_t *out){
     if (*pos >= len) return 0;
@@ -24,6 +41,31 @@ static int read_variant(const unsigned char *p, size_t len, size_t *pos, uint64_
     *pos += n;
     *out = v;
     return 1;
+}
+
+static size_t quic_collect_crypto(const unsigned char *pl, size_t len, unsigned char *data, unsigned char *have){
+
+    size_t i = 0;
+    while (i < len) {
+        uint64_t type;
+        if (!read_variant(pl, len, &i, &type)) break;
+        if (type == 0x00 || type == 0x01) continue;
+        if (type != 0x06) break;
+
+        uint64_t off, clen;
+        if (!read_variant(pl, len, &i, &off)) break;
+        if (!read_variant(pl, len, &i, &clen)) break;
+        if (clen > len - i) break;
+        if (off <= CH_MAX && clen <= CH_MAX - off) {
+            memcpy(data + off, pl + i, clen);
+            memset(have + off, 1, clen);
+        }
+        i += clen;
+    }
+
+    size_t prefix = 0;
+    while (prefix < CH_MAX && have[prefix]) prefix++;
+    return prefix;
 }
 
 int parse_quic_initial(const unsigned char *p, size_t len, struct quic_initial *q){
@@ -41,6 +83,7 @@ int parse_quic_initial(const unsigned char *p, size_t len, struct quic_initial *
 
     size_t scil = p[i++];
     if (scil > 20 || i + scil > len) return 0;
+    q->scid = p + i;  q->scid_len = scil;
     i += scil;
 
     uint64_t tok;
@@ -72,7 +115,7 @@ static int hkdf_expand_label(const unsigned char *secret, const char *label, uns
     return 1;
 }
 
-int derive_initial_keys(const unsigned char *dcid, size_t dcid_len, struct quic_keys *k) {
+int derive_initial_keys(const unsigned char *dcid, size_t dcid_len, int is_server, struct quic_keys *k) {
     static const unsigned char salt[20] = {
         0x38,0x76,0x2c,0xf7,0xf5,0x59,0x34,0xb3,0x4d,0x17,
         0x9a,0xe6,0xa4,0xc8,0x0c,0xad,0xcc,0xbb,0x7f,0x0a };
@@ -81,7 +124,10 @@ int derive_initial_keys(const unsigned char *dcid, size_t dcid_len, struct quic_
     unsigned int len = 0;
 
     if (!HMAC(EVP_sha256(), salt, sizeof salt, dcid, dcid_len, initial, &len)) return 0;
-    if (!hkdf_expand_label(initial, "client in", client, 32)) return 0;
+    const char *label;
+    if(is_server) label = "server in";
+    else label = "client in";
+    if (!hkdf_expand_label(initial, label, client, 32)) return 0;
     if (!hkdf_expand_label(client, "quic key", k->key, 16)) return 0;
     if (!hkdf_expand_label(client, "quic iv",  k->iv,  12)) return 0;
     if (!hkdf_expand_label(client, "quic hp",  k->hp,  16)) return 0;
@@ -157,40 +203,50 @@ int quic_decrypt_initial(const unsigned char *p, size_t len, const struct quic_i
     return 1;
 }
 
+int quic_find_server_hello(const unsigned char *pl, size_t len, const struct quic_initial *q, struct tls_server_hello *out){
+    struct ch *slot = quic_server_slot(q);
+
+    if(slot == NULL || slot->server_done) return 0;
+
+    size_t prefix = quic_collect_crypto(pl, len, slot->server_data, slot->server_have);
+    if(prefix < 4) return 0;
+    
+    size_t body_len = ((size_t)slot->server_data[1] << 16) | ((size_t)slot->server_data[2] << 8) | slot->server_data[3];
+    size_t message_len = body_len + 4;
+
+    if(message_len > prefix) return 0;
+
+    if(server_hello(slot->server_data, message_len, out)){
+        slot->server_done = 1;
+        return 1;
+    }
+    return 0;
+}
+
 int quic_find_sni(const unsigned char *pl, size_t len,
 			const unsigned char *dcid, size_t dcid_len,
 			char *out, size_t outsz) {
-
-    if (ch.dcid_len != dcid_len || memcmp(ch.dcid, dcid, dcid_len) != 0) {
-        memset(&ch, 0, sizeof ch);
-        memcpy(ch.dcid, dcid, dcid_len);
-        ch.dcid_len = dcid_len;
-    }
-    if (ch.done) return 0;
-
-    size_t i = 0;
-    while (i < len) {
-        uint64_t type;
-        if (!read_variant(pl, len, &i, &type)) break;
-        if (type == 0x00 || type == 0x01) continue;
-        if (type != 0x06) break;
-
-        uint64_t off, clen;
-        if (!read_variant(pl, len, &i, &off)) break;
-        if (!read_variant(pl, len, &i, &clen)) break;
-        if (clen > len - i) break;
-        if (off <= CH_MAX && clen <= CH_MAX - off) {
-            memcpy(ch.data + off, pl + i, clen);
-            memset(ch.have + off, 1, clen);
+    if (dcid_len > sizeof quic_flows[0].dcid) return 0;
+    struct ch *slot = NULL;
+    struct ch *free_slot = NULL;
+    for (int i = 0; i < MAX_FLOWS; i++){
+        if(quic_flows[i].active && quic_flows[i].dcid_len == dcid_len && memcmp(quic_flows[i].dcid, dcid, dcid_len) == 0){
+            slot = &quic_flows[i];
+            break;
         }
-        i += clen;
+        if(!quic_flows[i].active) free_slot = &quic_flows[i];
     }
-
-    size_t prefix = 0;
-    while (prefix < CH_MAX && ch.have[prefix]) prefix++;
-
-    if (extract_sni_hs(ch.data, prefix, out, outsz)) {
-        ch.done = 1;
+    if (slot == NULL){
+        if (free_slot == NULL) return 0;
+        slot = free_slot;
+        slot->dcid_len = dcid_len;
+        slot->active = 1;
+        memcpy(slot->dcid, dcid, dcid_len);
+    }
+    if (slot->client_done) return 0;
+    size_t prefix = quic_collect_crypto(pl, len, slot->client_data, slot->client_have);
+    if (extract_sni_hs(slot->client_data, prefix, out, outsz)) {
+        slot->client_done = 1;
         return 1;
     }
     return 0;

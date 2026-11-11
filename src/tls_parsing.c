@@ -118,7 +118,7 @@ int extract_sni(const unsigned char *p, size_t n, char *out, size_t cap) {
     return extract_sni_hs(p + 5, rd16(p + 3), out, cap);
 }
 
-static int server_hello(const unsigned char *p, size_t n, struct tls_server_hello *sh) {
+int server_hello(const unsigned char *p, size_t n, struct tls_server_hello *sh) {
     if (n < 42 || p[0] != 2 ||
         (((size_t)p[1] << 16) | ((size_t)p[2] << 8) | p[3]) != n - 4) return 0;
     memset(sh, 0, sizeof *sh);
