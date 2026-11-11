@@ -22,18 +22,32 @@ make app
 
 On Fedora, the Tkinter package is `python3-tkinter`. Click **Start capture**
 and authorize the request. The app runs as your normal user; a privileged helper
-starts only the existing capture program. **Stop** ends the capture. This mode
-captures on your computer and does not use ARP spoofing. The app's capture files
+starts only the existing capture program. **Stop** ends the capture. By default
+it captures traffic on your computer. To use IPv4 ARP spoofing, enable the
+option, enter the target and gateway IPv4 addresses, and start capture. The app
+can fill in the detected default gateway, or use the latest device scan to target
+all responding clients (excluding this computer and the gateway). Discovering
+devices starts the scan immediately. The all-devices option requires a new scan
+if the interface, local address, or default gateway changes. Use spoofing
+only on devices and networks you are authorized to inspect. Stop capture and
+wait for cleanup to finish before starting another session. The app's capture files
 are temporary and do not overwrite CLI logs. Use the CLI separately if you
 want to keep its logs.
 
-The dashboard shows interface download and upload rates, grouped TLS
-handshakes, and observed TLS hostnames. Click a category to filter the website
-list and select a handshake to see its ClientHello and ServerHello details.
-Categories use a small offline domain list in `app/model.py`; unknown domains
-are **Other**. They count observations, not visits or time spent. The app reads
-the existing TLS JSON file, so its website list does not include QUIC hostnames.
-Interface traffic rates include all traffic on that interface, not only TLS.
+**Discover devices** runs the existing IPv4 ARP scan after authorization and
+lists devices that reply. Run it only on a network you are authorized to scan;
+devices that do not respond will not appear.
+
+The dashboard shows observed TLS and QUIC hostnames alongside grouped TLS
+handshakes; the packet list is available in a separate tab. These are hostname
+observations, not a complete browsing history or confirmed page visits. Select
+a hostname to inspect its connection and available handshake details. Select
+a packet to see its Ethernet addresses, available protocol details, and first
+96 frame bytes. ARP requests and replies are included. Select a handshake to
+see its ClientHello and ServerHello details. The app displays the most recent
+1,000 packets; the packet data is collected in a temporary JSONL file during
+capture.
+The app opens full screen; press Escape to leave full screen or F11 to toggle it.
 
 Run the automated tests with `make test`. They require no root privileges or
 network access. The port-lock integration test requires a separate network

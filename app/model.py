@@ -1,25 +1,38 @@
 """Parse Netwatch's existing JSONL stream and group observations for the UI."""
-from collections import Counter, deque
+from collections import deque
 import json
+import ipaddress
 import os
-import time
-
-CATEGORIES = {
-    "Video": ("youtube.com", "youtu.be", "netflix.com", "twitch.tv", "vimeo.com", "googlevideo.com"),
-    "Social": ("reddit.com", "instagram.com", "facebook.com", "tiktok.com", "x.com", "twitter.com", "linkedin.com", "discord.com"),
-    "Shopping": ("amazon.com", "amazon.pl", "allegro.pl", "ebay.com", "aliexpress.com"),
-    "Work & tools": ("github.com", "gitlab.com", "stackoverflow.com", "openai.com", "slack.com", "microsoft.com", "office.com"),
-    "News": ("bbc.com", "bbc.co.uk", "reuters.com", "apnews.com", "theguardian.com"),
-    "Music": ("spotify.com", "soundcloud.com", "bandcamp.com"),
-}
+import fcntl
+import socket
+import struct
+import sys
 
 
-def category_for(hostname):
-    name = hostname.lower().rstrip(".")
-    for category, domains in CATEGORIES.items():
-        if any(name == domain or name.endswith("." + domain) for domain in domains):
-            return category
-    return "Other"
+def spoof_addresses(target, gateway):
+    try:
+        target = str(ipaddress.IPv4Address(target.strip()))
+        gateway = str(ipaddress.IPv4Address(gateway.strip()))
+    except ipaddress.AddressValueError as exc:
+        raise ValueError("Enter valid IPv4 addresses for the target and gateway.") from exc
+    if target == gateway:
+        raise ValueError("The target and gateway must be different addresses.")
+    return target, gateway
+
+
+def scan_addresses(output):
+    """Extract addresses from the CLI scan output, ignoring headers and duplicates."""
+    found = []
+    seen = set()
+    for line in output.splitlines():
+        try:
+            address = str(ipaddress.IPv4Address(line.strip()))
+        except ipaddress.AddressValueError:
+            continue
+        if address not in seen:
+            found.append(address)
+            seen.add(address)
+    return found
 
 
 def default_interface(route_path="/proc/net/route"):
@@ -32,28 +45,50 @@ def default_interface(route_path="/proc/net/route"):
     raise ValueError("No active default IPv4 route found")
 
 
-def interface_bytes(interface):
-    if not interface or "/" in interface or interface in (".", ".."):
-        raise ValueError("Invalid interface name")
-    base = f"/sys/class/net/{interface}/statistics"
-    with open(f"{base}/rx_bytes", encoding="ascii") as stream:
-        rx = int(stream.read())
-    with open(f"{base}/tx_bytes", encoding="ascii") as stream:
-        tx = int(stream.read())
-    return rx, tx
+def default_gateway(interface, route_path="/proc/net/route"):
+    with open(route_path, encoding="ascii") as routes:
+        next(routes, None)
+        for line in routes:
+            fields = line.split()
+            if len(fields) >= 4 and fields[0] == interface and fields[1] == "00000000":
+                flags, gateway = int(fields[3], 16), int(fields[2], 16)
+                if flags & 3 == 3 and 0 < gateway <= 0xffffffff:
+                    return str(ipaddress.IPv4Address(gateway.to_bytes(4, sys.byteorder)))
+    raise ValueError(f"No default IPv4 gateway found for {interface}.")
+
+
+def interface_address(interface):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        request = struct.pack("256s", interface.encode()[:15])
+        result = fcntl.ioctl(sock.fileno(), 0x8915, request)  # SIOCGIFADDR
+        return socket.inet_ntoa(result[20:24])
+
+
+def scanned_targets(addresses, gateway, own_ip, default_router):
+    excluded = {gateway, own_ip, default_router}
+    targets = list(dict.fromkeys(address for address in addresses if address not in excluded))
+    if not targets:
+        raise ValueError("No client devices were found in the last scan.")
+    if len(targets) > 64:
+        raise ValueError("The last scan found more than 64 clients; select a single target instead.")
+    return targets
 
 
 class CaptureModel:
     def __init__(self):
         self.handshakes = deque(maxlen=200)
-        self.websites = deque(maxlen=500)
-        self.categories = Counter()
-        self.observations = 0
+        self.websites = deque(maxlen=1000)
 
     def add(self, event):
         if not isinstance(event, dict):
             return
         kind = event.get("event")
+        if kind in ("client_hello", "quic_hostname"):
+            hostname, src = event.get("sni"), event.get("src")
+            if isinstance(hostname, str) and hostname and isinstance(src, str) and src:
+                self.websites.appendleft({"hostname": hostname, "src": src,
+                                          "protocol": "QUIC" if kind == "quic_hostname" else "TLS",
+                                          "ts": event.get("ts", 0), "event": event})
         if kind not in ("client_hello", "server_hello"):
             return
         src, dst = event.get("src"), event.get("dst")
@@ -73,12 +108,6 @@ class CaptureModel:
             match = {"key": key, "ts": ts, "client": None, "server": None}
             self.handshakes.appendleft(match)
         match["client" if client else "server"] = event
-        hostname = event.get("sni")
-        if client and isinstance(hostname, str) and hostname:
-            category = category_for(hostname)
-            self.websites.appendleft({"host": hostname, "ip": src, "category": category, "ts": ts})
-            self.categories[category] += 1
-            self.observations += 1
 
 
 class JsonLines:

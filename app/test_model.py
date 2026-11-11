@@ -7,15 +7,54 @@ import tempfile
 import time
 import unittest
 
-from model import CaptureModel, JsonLines, category_for, default_interface
-from main import graph_scale, handshake_text
+from model import (CaptureModel, JsonLines, default_gateway, default_interface,
+                   scan_addresses, scanned_targets, spoof_addresses)
+from main import handshake_text, packet_text, website_text
 
 
 class ModelTests(unittest.TestCase):
-    def test_graph_scale_rounds_up_and_handles_no_traffic(self):
-        self.assertEqual(graph_scale(0), 1000)
-        self.assertEqual(graph_scale(1234), 2000)
-        self.assertEqual(graph_scale(5000), 5000)
+    def test_websites_from_c_tls_and_quic_events(self):
+        model = CaptureModel()
+        model.add({"event": "client_hello", "src": "192.0.2.1", "dst": "192.0.2.2",
+                   "sport": 1234, "dport": 443, "sni": "example.com", "ts": 1})
+        model.add({"event": "quic_hostname", "src": "192.0.2.3", "sni": "example.org", "ts": 2})
+        self.assertEqual([(site["hostname"], site["protocol"]) for site in model.websites],
+                         [("example.org", "QUIC"), ("example.com", "TLS")])
+        self.assertEqual(len(model.handshakes), 1)
+
+    def test_website_details_show_matching_handshake_or_quic_endpoints(self):
+        model = CaptureModel()
+        client = {"event": "client_hello", "src": "192.0.2.1", "dst": "192.0.2.2",
+                  "sport": 1234, "dport": 443, "sni": "example.com", "ts": 1}
+        model.add(client)
+        site = model.websites[0]
+        self.assertIn("SERVER HELLO  ·  Not captured", website_text(site, model.handshakes))
+        model.add({"event": "server_hello", "src": "192.0.2.2", "dst": "192.0.2.1",
+                   "sport": 443, "dport": 1234, "cipher": "0x1301", "ts": 2})
+        self.assertIn("Selected cipher: 0x1301", website_text(site, model.handshakes))
+        model.add({"event": "quic_hostname", "src": "192.0.2.1", "dst": "192.0.2.9",
+                   "sport": 1234, "dport": 443, "sni": "example.org", "ts": 3})
+        details = website_text(model.websites[0], model.handshakes)
+        self.assertIn("Destination IP: 192.0.2.9", details)
+        self.assertIn("Destination port: 443", details)
+
+    def test_spoof_addresses_validate_target_and_gateway(self):
+        self.assertEqual(spoof_addresses(" 192.0.2.2 ", "192.0.2.1"), ("192.0.2.2", "192.0.2.1"))
+        for target, gateway in (("invalid", "192.0.2.1"), ("192.0.2.1", "192.0.2.1"), ("::1", "192.0.2.1")):
+            with self.assertRaises(ValueError):
+                spoof_addresses(target, gateway)
+
+    def test_scan_addresses_ignores_headers_invalid_and_duplicates(self):
+        output = "Detected interface: wlan0\nReachable IPv4 addresses:\n192.168.1.1\n192.168.1.2\n192.168.1.1\n300.1.1.1\n"
+        self.assertEqual(scan_addresses(output), ["192.168.1.1", "192.168.1.2"])
+        self.assertEqual(scan_addresses("no replies\n"), [])
+
+    def test_arp_packet_details(self):
+        packet = {"protocol": "ARP", "length": 42, "src": "192.0.2.1", "dst": "192.0.2.2",
+                  "arp_op": 1, "hex": "00010203"}
+        text = packet_text(packet)
+        self.assertIn("ARP operation: Request", text)
+        self.assertIn("00 01 02 03", text)
 
     def test_handshake_details_include_both_sides_or_missing_message(self):
         item = {"key": ("a", 1234, "b", 443), "client": {"sni": "example.com", "alpn": ["h2"]},
@@ -26,11 +65,6 @@ class ModelTests(unittest.TestCase):
         self.assertIn("Selected cipher: 0x1301", text)
         item["server"] = None
         self.assertIn("SERVER HELLO  ·  Not captured", handshake_text(item))
-
-    def test_categories_match_domain_boundaries(self):
-        self.assertEqual(category_for("WWW.YouTube.com."), "Video")
-        self.assertEqual(category_for("notyoutube.com"), "Other")
-        self.assertEqual(category_for("unknown.example"), "Other")
 
     def test_handshake_pairing_and_reused_port(self):
         model = CaptureModel()
@@ -43,7 +77,6 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(len(model.handshakes), 1)
         self.assertEqual(model.handshakes[0]["client"], client)
         self.assertEqual(model.handshakes[0]["server"], server)
-        self.assertEqual(model.categories["Video"], 1)
         model.add({**client, "ts": 20})
         self.assertEqual(len(model.handshakes), 2)
         self.assertIsNone(model.handshakes[0]["server"])
@@ -79,6 +112,20 @@ class ModelTests(unittest.TestCase):
             path.write_text("header\neth0 00000000 00000000 0000\nwlan0 00000000 01010101 0003\n", encoding="ascii")
             self.assertEqual(default_interface(path), "wlan0")
 
+    def test_gateway_from_selected_interface(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "route"
+            gateway = int.from_bytes(bytes([192, 168, 1, 1]), sys.byteorder)
+            path.write_text(f"header\neth0 00000000 {gateway:08X} 0003\nwlan0 00000000 {gateway:08X} 0003\n", encoding="ascii")
+            self.assertEqual(default_gateway("wlan0", path), "192.168.1.1")
+            with self.assertRaises(ValueError): default_gateway("missing", path)
+
+    def test_all_scanned_excludes_computer_and_routers(self):
+        addresses = ["192.168.1.1", "192.168.1.2", "192.168.1.3", "192.168.1.3", "192.168.1.4"]
+        self.assertEqual(scanned_targets(addresses, "192.168.1.4", "192.168.1.2", "192.168.1.1"), ["192.168.1.3"])
+        with self.assertRaises(ValueError): scanned_targets(addresses[:2], "192.168.1.1", "192.168.1.2", "192.168.1.1")
+        with self.assertRaises(ValueError): scanned_targets([f"10.0.0.{n}" for n in range(1, 66)], "192.0.2.1", "192.0.2.2", "192.0.2.1")
+
     def test_helper_stops_capture_when_control_pipe_closes(self):
         with tempfile.TemporaryDirectory() as directory:
             executable = Path(directory) / "capture"
@@ -105,6 +152,23 @@ class ModelTests(unittest.TestCase):
                     process.kill()
                     process.wait()
                 process.stdout.close()
+
+    def test_helper_passes_spoof_arguments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "capture"
+            executable.write_text("#!/usr/bin/env python3\nimport json, pathlib, sys\npathlib.Path('args').write_text(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
+            os.chmod(executable, 0o755)
+            helper = Path(__file__).with_name("capture_helper.py")
+            process = subprocess.Popen([sys.executable, str(helper), str(executable), directory, "192.0.2.2", "192.0.2.1", "192.0.2.3"],
+                                       stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(process.wait(timeout=5), 0)
+            finally:
+                if process.poll() is None: process.kill(); process.wait()
+                process.stdin.close()
+                process.stderr.close()
+            self.assertEqual(json.loads((Path(directory) / "args").read_text()),
+                             ["--packet-json", "--spoof", "192.0.2.2", "192.0.2.1", "192.0.2.3"])
 
 
 if __name__ == "__main__":

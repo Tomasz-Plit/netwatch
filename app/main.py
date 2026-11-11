@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Local desktop dashboard for the Netwatch capture engine."""
+"""Desktop packet viewer for the Netwatch capture engine."""
 import os
-import math
 from pathlib import Path
 import queue
 import subprocess
@@ -10,87 +9,103 @@ import tempfile
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox
-from tkinter import font as tkfont
+from tkinter import font as tkfont, messagebox, ttk
 
-from model import CaptureModel, JsonLines, default_interface, interface_bytes
+from model import (CaptureModel, JsonLines, default_gateway, default_interface,
+                   interface_address, scan_addresses, scanned_targets, spoof_addresses)
 
 ROOT = Path(__file__).resolve().parent.parent
-BG = "#101923"
-CARD = "#192634"
-TEXT = "#e6edf4"
-MUTED = "#9bafbe"
-GREEN = "#53d3ad"
-BLUE = "#65a6ff"
-CATEGORY_COLORS = ("#5ccfba", "#7ca8ff", "#f2bd72", "#b994ef", "#ec91a4", "#7fbfdf", "#8292a2")
+BG, CARD, TEXT, MUTED, GREEN = "#101923", "#192634", "#e6edf4", "#9bafbe", "#53d3ad"
 
 
 def handshake_text(item):
     client, server = item["client"], item["server"]
-    source, sport, destination, dport = item["key"]
-    lines = [f"{source}:{sport}  →  {destination}:{dport}", ""]
+    src, sport, dst, dport = item["key"]
+    lines = [f"{src}:{sport}  →  {dst}:{dport}", ""]
     if client:
-        lines.extend(["CLIENT HELLO", f"  Hostname: {client.get('sni') or 'Not available'}"])
+        lines += ["CLIENT HELLO", f"  Hostname: {client.get('sni') or 'Not available'}"]
         for key, label in (("versions", "Supported versions"), ("alpn", "Protocols")):
-            values = client.get(key)
-            if isinstance(values, list) and values:
-                lines.append(f"  {label}: {', '.join(map(str, values))}")
+            if client.get(key):
+                lines.append(f"  {label}: {', '.join(map(str, client[key]))}")
     else:
         lines.append("CLIENT HELLO  ·  Not captured")
     lines.append("")
     if server:
-        lines.extend(["SERVER HELLO", f"  TLS version: {server.get('version', 'Not available')}",
-                      f"  Selected cipher: {server.get('cipher', 'Not available')}"])
-        if server.get("key_share_group"):
-            lines.append(f"  Key share group: {server['key_share_group']}")
-        if isinstance(server.get("client_to_server_hello_ms"), (int, float)):
-            lines.append(f"  Response time: {server['client_to_server_hello_ms']:.1f} ms")
+        lines += ["SERVER HELLO", f"  TLS version: {server.get('version', 'Not available')}",
+                  f"  Selected cipher: {server.get('cipher', 'Not available')}"]
     else:
         lines.append("SERVER HELLO  ·  Not captured")
     if client:
         for key, label in (("ciphers", "Offered ciphers"), ("groups", "Groups"),
                            ("sig_algs", "Signature algorithms"), ("key_shares", "Key shares")):
-            values = client.get(key)
-            if isinstance(values, list) and values:
-                lines.extend(["", f"{label}:  {', '.join(map(str, values))}"])
+            if client.get(key):
+                lines += ["", f"{label}: {', '.join(map(str, client[key]))}"]
     return "\n".join(lines)
 
 
-def rate(value):
-    for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
-        if value < 1000 or unit == "GB/s":
-            return f"{value:.1f} {unit}"
-        value /= 1000
+def packet_text(packet):
+    lines = [f"Protocol: {packet.get('protocol', 'Unknown')}", f"Length: {packet.get('length', 0)} bytes",
+             "", "ETHERNET", f"  Source MAC: {packet.get('src_mac', 'Unknown')}",
+             f"  Destination MAC: {packet.get('dst_mac', 'Unknown')}", "", "NETWORK",
+             f"  Source: {packet.get('src') or 'Not available'}",
+             f"  Destination: {packet.get('dst') or 'Not available'}"]
+    if packet.get("protocol") == "ARP":
+        operation = packet.get("arp_op")
+        lines.append(f"  ARP operation: { {1: 'Request', 2: 'Reply'}.get(operation, str(operation)) }")
+    if packet.get("protocol") in ("TCP", "UDP"):
+        lines += ["", packet["protocol"], f"  Source port: {packet.get('sport', 0)}",
+                  f"  Destination port: {packet.get('dport', 0)}"]
+    raw = packet.get("hex", "")
+    if isinstance(raw, str) and raw:
+        lines += ["", "FRAME BYTES (first 96 bytes)"]
+        lines += [f"  {offset // 2:04x}  " + " ".join(raw[i:i + 2] for i in range(offset, min(offset + 32, len(raw)), 2))
+                  for offset in range(0, len(raw), 32)]
+    return "\n".join(lines)
 
 
-def graph_scale(peak):
-    """Round up to a readable scale without hiding small amounts of traffic."""
-    if peak <= 0:
-        return 1000
-    magnitude = 10 ** math.floor(math.log10(peak))
-    for step in (1, 2, 5, 10):
-        if peak <= step * magnitude:
-            return step * magnitude
+def website_text(site, handshakes):
+    event = site["event"]
+    lines = [f"Hostname: {site['hostname']}", f"Protocol: {site['protocol']}",
+             f"Source IP: {site['src']}"]
+    if event.get("dst"):
+        lines.append(f"Destination IP: {event['dst']}")
+    if event.get("sport") is not None:
+        lines.append(f"Source port: {event['sport']}")
+    if event.get("dport") is not None:
+        lines.append(f"Destination port: {event['dport']}")
+    if site["protocol"] == "TLS":
+        handshake = next((item for item in handshakes if item["client"] is event), None)
+        if handshake:
+            lines += ["", handshake_text(handshake)]
+        else:
+            lines += ["", "The matching handshake is no longer in the recent handshake list."]
+    else:
+        lines += ["", "Hostname found in a QUIC Initial handshake."]
+    return "\n".join(lines)
 
 
 class Dashboard(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Netwatch")
-        self.geometry("1200x880")
-        self.minsize(850, 660)
+        self.title("Netwatch · Packet Capture")
+        self.geometry("1200x800")
+        self.minsize(780, 550)
+        self.attributes("-fullscreen", True)
+        self.bind("<Escape>", lambda _event: self.attributes("-fullscreen", False))
+        self.bind("<F11>", lambda _event: self.attributes("-fullscreen", not self.attributes("-fullscreen")))
         self.configure(bg=BG)
         self.protocol("WM_DELETE_WINDOW", self.close)
-        self.process = None
-        self.reader = None
-        self.session = None
-        self.messages = queue.Queue()
+        self.process = self.session = self.reader = self.packet_reader = None
+        self.messages, self.scan_messages = queue.Queue(), queue.Queue()
+        self.scanning = False
+        self.scanned_addresses = []
+        self.scanned_interface = None
+        self.scanned_own = None
+        self.scanned_gateway = None
+        self.spoof_ready = False
         self.model = CaptureModel()
-        self.interface = None
-        self.previous = None
-        self.download = [0] * 60
-        self.upload = [0] * 60
-        self.filter_category = None
+        self.packet_rows = {}
+        self.website_rows = {}
         self.handshake_rows = {}
         self._build()
         self.after(500, self.tick)
@@ -98,173 +113,189 @@ class Dashboard(tk.Tk):
     def _build(self):
         style = ttk.Style(self)
         style.theme_use("clam")
-        self.table_font = tkfont.Font(family="Sans", size=10)
-        self.graph_font = tkfont.Font(family="Sans", size=9)
-        self.time_column_width = self.table_font.measure("00:00:00") + 24
+        table_font = tkfont.Font(family="Sans", size=10)
+        self.time_width = table_font.measure("00:00:00") + 24
         style.configure("Treeview", background=CARD, fieldbackground=CARD, foreground=TEXT,
-                        borderwidth=0, rowheight=self.table_font.metrics("linespace") + 12,
-                        font=self.table_font)
-        style.configure("Treeview.Heading", background="#243749", foreground=MUTED,
-                        relief="flat", font=("Sans", 9, "bold"))
+                        borderwidth=0, rowheight=table_font.metrics("linespace") + 12, font=table_font)
+        style.configure("Treeview.Heading", background="#243749", foreground=MUTED, relief="flat")
         style.map("Treeview", background=[("selected", "#31546a")], foreground=[("selected", TEXT)])
-        main = tk.Frame(self, bg=BG, padx=24, pady=18)
+        main = tk.Frame(self, bg=BG, padx=22, pady=18)
         main.pack(fill="both", expand=True)
         header = tk.Frame(main, bg=BG)
-        header.pack(fill="x", pady=(0, 10))
+        header.pack(fill="x")
         tk.Label(header, text="NETWATCH", bg=BG, fg=TEXT, font=("Sans", 20, "bold")).pack(side="left")
-        tk.Label(header, text="  /  LOCAL CAPTURE", bg=BG, fg=MUTED, font=("Sans", 10)).pack(side="left", pady=(8, 0))
-        self.stop_button = tk.Button(header, text="Stop", command=self.stop, state="disabled",
-                                     bg="#354859", fg=TEXT, relief="flat", padx=16, pady=6)
+        tk.Label(header, text="  /  PACKET CAPTURE", bg=BG, fg=MUTED).pack(side="left")
+        tk.Button(header, text="Close", command=self.close, bg="#354859", fg=TEXT,
+                  relief="flat", padx=16).pack(side="right", padx=(8, 0))
+        self.stop_button = tk.Button(header, text="Stop", command=self.stop, state="disabled", bg="#354859", fg=TEXT, relief="flat", padx=16)
         self.stop_button.pack(side="right", padx=(8, 0))
-        self.start_button = tk.Button(header, text="Start capture", command=self.start,
-                                      bg=GREEN, fg="#10211d", relief="flat", padx=16, pady=6)
+        self.start_button = tk.Button(header, text="Start capture", command=self.start, bg=GREEN, fg="#10211d", relief="flat", padx=16)
         self.start_button.pack(side="right")
+        tk.Button(header, text="Discover devices", command=self.open_discovery, bg="#354859", fg=TEXT, relief="flat", padx=16).pack(side="right", padx=(0, 8))
         self.status = tk.StringVar(value="Ready · capture is stopped")
-        tk.Label(main, textvariable=self.status, bg=BG, fg=MUTED, anchor="w").pack(fill="x", pady=(0, 12))
-        self.down_graph = self.make_graph(main, "DOWNLOAD", BLUE)
-        self.up_graph = self.make_graph(main, "UPLOAD", GREEN)
-        middle = tk.Frame(main, bg=BG)
-        middle.pack(fill="both", expand=True, pady=(6, 10))
-        middle.columnconfigure(0, weight=2, uniform="middle")
-        middle.columnconfigure(1, weight=3, uniform="middle")
-        middle.rowconfigure(0, weight=1)
-        categories = tk.Frame(middle, bg=CARD, padx=14, pady=12)
-        categories.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        self.label(categories, "WEBSITE CATEGORIES", 11, True).pack(anchor="w")
-        self.label(categories, "Share of hostname observations", 9, color=MUTED).pack(anchor="w", pady=(3, 2))
-        self.categories = tk.Canvas(categories, bg=CARD, highlightthickness=0, height=220)
-        self.categories.pack(fill="both", expand=True)
-        self.categories.bind("<Configure>", lambda _event: self.draw_categories())
-        self.categories.bind("<Button-1>", self.category_clicked)
-        self.category_status = tk.StringVar(value="All categories")
-        tk.Button(categories, textvariable=self.category_status, command=lambda: self.set_filter(None),
-                  bg="#2b4050", fg=TEXT, relief="flat").pack(anchor="w", pady=(5, 0))
-        handshakes = tk.Frame(middle, bg=CARD, padx=14, pady=12)
+        tk.Label(main, textvariable=self.status, bg=BG, fg=MUTED, anchor="w").pack(fill="x", pady=(8, 12))
+        mode = tk.Frame(main, bg=BG)
+        mode.pack(fill="x", pady=(0, 12))
+        self.spoof_enabled = tk.BooleanVar(value=False)
+        self.spoof_toggle = tk.Checkbutton(mode, text="IPv4 ARP spoofing", variable=self.spoof_enabled,
+                                           command=self.update_spoof_controls, bg=BG, fg=TEXT,
+                                           selectcolor=CARD, activebackground=BG, activeforeground=TEXT)
+        self.spoof_toggle.pack(side="left", padx=(0, 16))
+        tk.Label(mode, text="Target IP", bg=BG, fg=MUTED).pack(side="left")
+        self.target_entry = tk.Entry(mode, width=18)
+        self.target_entry.pack(side="left", padx=(6, 16))
+        tk.Label(mode, text="Gateway IP", bg=BG, fg=MUTED).pack(side="left")
+        self.gateway_entry = tk.Entry(mode, width=18)
+        self.gateway_entry.pack(side="left", padx=(6, 0))
+        self.gateway_button = tk.Button(mode, text="Use detected gateway", command=self.fill_gateway,
+                                        bg="#354859", fg=TEXT, relief="flat", padx=8)
+        self.gateway_button.pack(side="left", padx=(8, 0))
+        self.spoof_all = tk.BooleanVar(value=False)
+        self.all_toggle = tk.Checkbutton(mode, text="All scanned devices", variable=self.spoof_all,
+                                         command=self.update_spoof_controls, bg=BG, fg=TEXT,
+                                         selectcolor=CARD, activebackground=BG, activeforeground=TEXT)
+        self.all_toggle.pack(side="left", padx=(16, 0))
+        self.update_spoof_controls()
+        content = tk.Frame(main, bg=BG)
+        content.pack(fill="both", expand=True)
+        content.columnconfigure(0, weight=3, uniform="content")
+        content.columnconfigure(1, weight=2, uniform="content")
+        content.rowconfigure(0, weight=1)
+        packets = tk.Frame(content, bg=CARD, padx=12, pady=12)
+        handshakes = tk.Frame(content, bg=CARD, padx=12, pady=12)
+        packets.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         handshakes.grid(row=0, column=1, sticky="nsew")
-        self.label(handshakes, "TLS HANDSHAKES", 11, True).pack(anchor="w")
-        self.label(handshakes, "Select a row for handshake details", 9, color=MUTED).pack(anchor="w", pady=(3, 8))
+        tabs = ttk.Notebook(packets)
+        tabs.pack(fill="both", expand=True)
+        websites = tk.Frame(tabs, bg=CARD, padx=8, pady=8)
+        packet_tab = tk.Frame(tabs, bg=CARD, padx=8, pady=8)
+        tabs.add(websites, text="Observed websites")
+        tabs.add(packet_tab, text="Packets")
+        tk.Label(websites, text="Observed hostnames · not a complete browsing history", bg=CARD, fg=TEXT, anchor="w").pack(fill="x", pady=(0, 6))
+        self.website_tree = self.tree(websites, ("time", "hostname", "src", "protocol"),
+                                     ("Time", "Hostname", "Source IP", "Protocol"))
+        self.website_tree.column("time", width=self.time_width, minwidth=self.time_width, stretch=False)
+        self.website_tree.bind("<<TreeviewSelect>>", self.website_details)
+        self.website_detail = self.details(websites, "Select a website to inspect its connection.")
+        tk.Label(packet_tab, text="Captured packets · most recent 1,000", bg=CARD, fg=TEXT, anchor="w").pack(fill="x", pady=(0, 6))
+        self.packet_tree = self.tree(packet_tab, ("time", "protocol", "src", "dst", "length"),
+                                     ("Time", "Protocol", "Source", "Destination", "Bytes"))
+        self.packet_tree.column("time", width=self.time_width, minwidth=self.time_width, stretch=False)
+        self.packet_tree.column("protocol", width=100, minwidth=90, stretch=False)
+        self.packet_tree.column("length", width=90, minwidth=75, stretch=False)
+        self.packet_tree.bind("<<TreeviewSelect>>", self.packet_details)
+        self.packet_detail = self.details(packet_tab, "Select a packet to inspect its fields.")
+        tk.Label(handshakes, text="Recent TLS handshakes · client and server messages grouped", bg=CARD, fg=TEXT, anchor="w").pack(fill="x", pady=(0, 6))
         self.handshake_tree = self.tree(handshakes, ("time", "website", "status"), ("Time", "Hostname / server", "Messages"))
-        self.handshake_tree.column("time", width=self.time_column_width, minwidth=self.time_column_width, stretch=False)
-        status_width = self.table_font.measure("Client + server") + 24
-        self.handshake_tree.column("status", width=status_width, minwidth=status_width, stretch=False)
+        self.handshake_tree.column("time", width=self.time_width, minwidth=self.time_width, stretch=False)
         self.handshake_tree.bind("<<TreeviewSelect>>", self.handshake_details)
-        detail_frame = tk.Frame(handshakes, bg="#111d28")
-        detail_frame.pack(fill="both", expand=True, pady=(8, 0))
-        self.detail = tk.Text(detail_frame, height=6, bg="#111d28", fg=TEXT, relief="flat",
-                              font=("Sans", 10), wrap="word", padx=10, pady=8)
-        detail_scroll = ttk.Scrollbar(detail_frame, orient="vertical", command=self.detail.yview)
-        self.detail.configure(yscrollcommand=detail_scroll.set)
-        detail_scroll.pack(side="right", fill="y")
-        self.detail.pack(fill="both", expand=True)
-        self.detail.insert("1.0", "Select a handshake to view its messages.")
-        self.detail.configure(state="disabled")
-        bottom = tk.Frame(main, bg=CARD, padx=14, pady=12)
-        bottom.pack(fill="both", expand=True)
-        self.label(bottom, "RECENT WEBSITE OBSERVATIONS", 11, True).pack(anchor="w")
-        self.label(bottom, "TLS hostnames only · observations are not complete browsing history", 9, color=MUTED).pack(anchor="w", pady=(3, 8))
-        self.website_tree = self.tree(bottom, ("time", "website", "category", "visitor"),
-                                      ("Time", "Hostname", "Category", "Client IP"))
-        self.website_tree.column("time", width=self.time_column_width, minwidth=self.time_column_width, stretch=False)
-        category_width = self.table_font.measure("Work & tools") + 24
-        self.website_tree.column("category", width=category_width, minwidth=category_width, stretch=False)
-        self.website_tree.column("visitor", width=180)
-
-    def label(self, parent, text, size, bold=False, color=TEXT):
-        return tk.Label(parent, text=text, bg=CARD, fg=color, anchor="w", font=("Sans", size, "bold" if bold else "normal"))
+        self.detail = self.details(handshakes, "Select a handshake to inspect its fields.")
 
     def tree(self, parent, columns, headings):
         holder = tk.Frame(parent, bg=CARD)
         holder.pack(fill="both", expand=True)
-        tree = ttk.Treeview(holder, columns=columns, show="headings", height=5)
+        tree = ttk.Treeview(holder, columns=columns, show="headings", height=8)
         for name, title in zip(columns, headings):
             tree.heading(name, text=title, anchor="w")
             tree.column(name, width=150, minwidth=80, anchor="w")
-        bar = ttk.Scrollbar(holder, orient="vertical", command=tree.yview)
+        vertical = ttk.Scrollbar(holder, orient="vertical", command=tree.yview)
         horizontal = ttk.Scrollbar(holder, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=bar.set, xscrollcommand=horizontal.set)
-        bar.pack(side="right", fill="y")
+        tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        vertical.pack(side="right", fill="y")
         horizontal.pack(side="bottom", fill="x")
         tree.pack(fill="both", expand=True)
         return tree
 
-    def make_graph(self, parent, title, color):
-        frame = tk.Frame(parent, bg=CARD, padx=14, pady=9)
-        frame.pack(fill="x", pady=(0, 8))
-        row = tk.Frame(frame, bg=CARD)
-        row.pack(fill="x")
-        self.label(row, title, 10, True).pack(side="left")
-        value = tk.StringVar(value="—")
-        tk.Label(row, textvariable=value, bg=CARD, fg=color, font=("Sans", 14, "bold")).pack(side="right")
-        canvas = tk.Canvas(frame, height=100, bg=CARD, highlightthickness=0)
-        canvas.pack(fill="x")
-        return canvas, value, color
+    def details(self, parent, placeholder):
+        frame = tk.Frame(parent, bg="#111d28")
+        frame.pack(fill="both", expand=True, pady=(10, 0))
+        text = tk.Text(frame, height=9, bg="#111d28", fg=TEXT, relief="flat", font=("Monospace", 10), wrap="word", padx=10, pady=8)
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        text.pack(fill="both", expand=True)
+        self.set_details(text, placeholder)
+        return text
 
-    def draw_graph(self, graph, data):
-        canvas, value, color = graph
-        canvas.delete("all")
-        w, h = max(canvas.winfo_width(), 2), max(canvas.winfo_height(), 2)
-        maximum = graph_scale(max(data))
-        labels = [rate(maximum), rate(maximum / 2), rate(0)]
-        left = max(self.graph_font.measure(label) for label in labels) + 14
-        top = self.graph_font.metrics("linespace") / 2 + 2
-        bottom = h - self.graph_font.metrics("linespace") - 5
-        right = max(left + 1, w - 8)
-        if bottom <= top:
-            return
-        for index, label in enumerate(labels):
-            y = top + (bottom - top) * index / 2
-            canvas.create_line(left, y, right, y, fill="#2a3947")
-            canvas.create_text(left - 8, y, text=label, anchor="e", fill=MUTED, font=self.graph_font)
-        canvas.create_text(left, h - 2, text="60 seconds ago", anchor="sw", fill=MUTED, font=self.graph_font)
-        canvas.create_text(right, h - 2, text="now", anchor="se", fill=MUTED, font=self.graph_font)
-        points = []
-        for i, sample in enumerate(data):
-            points.extend((left + i * (right - left) / (len(data) - 1),
-                           bottom - sample / maximum * (bottom - top)))
-        fill = "#243d59" if graph is self.down_graph else "#1e483f"
-        canvas.create_polygon(left, bottom, *points, right, bottom, fill=fill, outline="")
-        canvas.create_line(*points, fill=color, width=2)
-        value.set(rate(data[-1]))
+    @staticmethod
+    def set_details(widget, value):
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", value)
+        widget.configure(state="disabled")
 
     def start(self):
         if self.process is not None:
             return
         try:
-            self.interface = default_interface()
-            self.previous = (*interface_bytes(self.interface), time.monotonic())
-            if self.reader:
-                self.reader.close()
-            if self.session:
-                self.session.cleanup()
+            interface = default_interface()
+            spoof = ()
+            if self.spoof_enabled.get():
+                gateway = self.gateway_entry.get().strip()
+                if self.spoof_all.get():
+                    own_ip = interface_address(interface)
+                    router = default_gateway(interface)
+                    if (self.scanning or self.scanned_interface != interface or
+                            self.scanned_own != own_ip or self.scanned_gateway != router):
+                        raise ValueError("Scan devices on the current network before choosing all scanned devices.")
+                    targets = scanned_targets(self.scanned_addresses, gateway, own_ip, router)
+                    first, gateway = spoof_addresses(targets[0], gateway)
+                    spoof = (first, gateway, *targets[1:])
+                else:
+                    spoof = spoof_addresses(self.target_entry.get(), gateway)
+            for reader in (self.reader, self.packet_reader):
+                if reader: reader.close()
+            if self.session: self.session.cleanup()
             self.session = tempfile.TemporaryDirectory(prefix="netwatch-")
-            self.model = CaptureModel()
             self.reader = JsonLines(os.path.join(self.session.name, "netwatch_tls.jsonl"))
-            self.download = [0] * 60
-            self.upload = [0] * 60
-            self.filter_category = None
+            self.packet_reader = JsonLines(os.path.join(self.session.name, "netwatch_packets.jsonl"))
+            self.model = CaptureModel()
+            self.packet_tree.delete(*self.packet_tree.get_children())
+            self.website_tree.delete(*self.website_tree.get_children())
+            self.handshake_tree.delete(*self.handshake_tree.get_children())
+            self.packet_rows.clear(); self.handshake_rows.clear()
+            self.website_rows.clear()
+            self.set_details(self.website_detail, "Select a website to inspect its connection.")
+            self.set_details(self.packet_detail, "Select a packet to inspect its fields.")
+            self.set_details(self.detail, "Select a handshake to inspect its fields.")
             self.last_error = "authorization cancelled or capture failed"
-            self.refresh()
-            self.process = subprocess.Popen(
-                ["pkexec", sys.executable, str(ROOT / "app/capture_helper.py"),
-                 str(ROOT / "netwatch"), self.session.name],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                text=True, bufsize=1)
-            process = self.process
-            threading.Thread(target=self.read_errors, args=(process,), daemon=True).start()
-            self.status.set(f"Waiting for authorization · {self.interface}")
+            self.spoof_ready = False
+            self.capture_spoof = bool(spoof)
+            self.process = subprocess.Popen(["pkexec", sys.executable, str(ROOT / "app/capture_helper.py"), str(ROOT / "netwatch"), self.session.name, *spoof],
+                                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, bufsize=1)
+            threading.Thread(target=self.read_errors, args=(self.process,), daemon=True).start()
+            self.interface = interface
+            self.status.set(f"Waiting for authorization · {interface}")
             self.start_button.configure(state="disabled")
             self.stop_button.configure(state="normal")
+            self.spoof_toggle.configure(state="disabled")
+            self.update_spoof_controls()
         except (OSError, ValueError) as exc:
-            if self.reader:
-                self.reader.close(); self.reader = None
-            if self.session:
-                self.session.cleanup(); self.session = None
             messagebox.showerror("Cannot start capture", str(exc))
 
     def read_errors(self, process):
         for line in process.stderr:
             self.messages.put((process, line.strip()))
         process.stderr.close()
+
+    def update_spoof_controls(self):
+        state = "normal" if self.spoof_enabled.get() and self.process is None else "disabled"
+        self.target_entry.configure(state="disabled" if self.spoof_all.get() else state)
+        self.gateway_entry.configure(state=state)
+        self.gateway_button.configure(state=state)
+        self.all_toggle.configure(state=state)
+        if state == "normal" and not self.gateway_entry.get():
+            self.fill_gateway(silent=True)
+
+    def fill_gateway(self, silent=False):
+        try:
+            gateway = default_gateway(default_interface())
+        except (OSError, ValueError) as exc:
+            if not silent:
+                messagebox.showerror("Cannot detect gateway", str(exc))
+            return
+        self.gateway_entry.delete(0, "end")
+        self.gateway_entry.insert(0, gateway)
 
     def stop(self):
         if self.process and self.process.stdin:
@@ -273,154 +304,158 @@ class Dashboard(tk.Tk):
             self.status.set("Stopping capture…")
             self.stop_button.configure(state="disabled")
 
-    def tick(self):
-        while True:
+    def open_discovery(self):
+        if getattr(self, "discovery_window", None) and self.discovery_window.winfo_exists():
+            self.discovery_window.lift(); return
+        self.discovery_window = window = tk.Toplevel(self)
+        window.title("Discover IPv4 devices")
+        width = min(window.winfo_screenwidth(), max(700, int(window.winfo_screenwidth() * 0.65)))
+        height = min(window.winfo_screenheight(), max(550, int(window.winfo_screenheight() * 0.7)))
+        window.geometry(f"{width}x{height}+{max(0, (window.winfo_screenwidth() - width) // 2)}+{max(0, (window.winfo_screenheight() - height) // 2)}")
+        window.transient(self)
+        window.configure(bg=BG)
+        frame = tk.Frame(window, bg=BG, padx=20, pady=18); frame.pack(fill="both", expand=True)
+        tk.Label(frame, text="LOCAL DEVICES", bg=BG, fg=TEXT, font=("Sans", 16, "bold")).pack(anchor="w")
+        tk.Label(frame, text="Responding IPv4 devices on the local subnet", bg=BG, fg=MUTED).pack(anchor="w", pady=(4, 12))
+        self.scan_status = tk.StringVar(value="Ready to scan")
+        tk.Label(frame, textvariable=self.scan_status, bg=BG, fg=MUTED, wraplength=max(400, width - 80), justify="left").pack(anchor="w", pady=(0, 8))
+        self.scan_tree = self.tree(frame, ("ip",), ("IPv4 address",))
+        if not self.scanning:
+            self.start_scan()
+
+    def start_scan(self):
+        if self.scanning: return
+        try:
+            interface = default_interface()
+            own_ip = interface_address(interface)
             try:
-                process, line = self.messages.get_nowait()
-            except queue.Empty:
-                break
+                router = default_gateway(interface)
+            except (OSError, ValueError):
+                router = None
+            process = subprocess.Popen(["pkexec", str(ROOT / "netwatch"), "--scan"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except (OSError, ValueError) as exc:
+            self.scan_status.set(f"Could not start scan: {exc}"); return
+        self.scanning = True
+        self.scanned_addresses = []
+        self.scanned_interface = None
+        self.scanned_own = self.scanned_gateway = None
+        self.scan_tree.delete(*self.scan_tree.get_children())
+        self.scan_status.set("Waiting for authorization and scan results…")
+        threading.Thread(target=self.collect_scan, args=(process, interface, own_ip, router), daemon=True).start()
+
+    def collect_scan(self, process, interface, own_ip, router):
+        stdout, stderr = process.communicate()
+        self.scan_messages.put((process.returncode, stdout, stderr, interface, own_ip, router))
+
+    def tick(self):
+        while not self.scan_messages.empty():
+            code, output, error, interface, own_ip, router = self.scan_messages.get_nowait()
+            self.scanning = False
+            if not code:
+                self.scanned_addresses = scan_addresses(output)
+                self.scanned_interface = interface
+                self.scanned_own, self.scanned_gateway = own_ip, router
+            if getattr(self, "discovery_window", None) and self.discovery_window.winfo_exists():
+                if code:
+                    self.scan_status.set(f"Scan failed: {error.strip() or 'authorization cancelled or scan failed'}")
+                else:
+                    addresses = self.scanned_addresses
+                    for address in addresses: self.scan_tree.insert("", "end", values=(address,))
+                    self.scan_status.set(f"Scan complete · {len(addresses)} responding device(s)")
+        while not self.messages.empty():
+            process, line = self.messages.get_nowait()
             if process is self.process and line:
                 self.last_error = line
+                if line.startswith("[arp] spoofing "):
+                    self.spoof_ready = True
         if self.process:
             try:
-                if self.reader:
-                    events = self.reader.read()
-                    for event in events:
-                        self.model.add(event)
-                    if events:
-                        self.refresh()
-                    if self.reader.file and self.process.poll() is None and self.process.stdin:
-                        self.status.set(f"Capturing · {self.interface} · TLS hostnames only")
+                for packet in self.packet_reader.read(): self.add_packet(packet)
+                events = self.reader.read()
+                for event in events: self.model.add(event)
+                if any(isinstance(event, dict) and event.get("event") in
+                       ("client_hello", "server_hello", "quic_hostname") for event in events):
+                    self.refresh_handshakes()
+                    self.refresh_websites()
+                if self.packet_reader.file and self.process.poll() is None and self.process.stdin:
+                    if self.capture_spoof and not self.spoof_ready:
+                        self.status.set(f"Starting IPv4 spoofing · {self.interface}")
+                    else:
+                        mode = "IPv4 spoofing" if self.capture_spoof else "local capture"
+                        self.status.set(f"Capturing packets · {self.interface} · {mode}")
                 if self.process.poll() is not None:
                     code = self.process.returncode
                     self.process = None
-                    self.start_button.configure(state="normal")
-                    self.stop_button.configure(state="disabled")
-                    if code:
-                        self.status.set(f"Capture ended (exit {code}) · {getattr(self, 'last_error', 'authorization cancelled or capture failed')}")
-                    else:
-                        self.status.set("Capture stopped")
-                else:
-                    rx, tx = interface_bytes(self.interface)
-                    now = time.monotonic()
-                    old_rx, old_tx, previous_time = self.previous
-                    elapsed = max(now - previous_time, 0.001)
-                    self.download = self.download[1:] + [max(0, rx - old_rx) / elapsed]
-                    self.upload = self.upload[1:] + [max(0, tx - old_tx) / elapsed]
-                    self.previous = (rx, tx, now)
+                    self.start_button.configure(state="normal"); self.stop_button.configure(state="disabled")
+                    self.spoof_toggle.configure(state="normal")
+                    self.update_spoof_controls()
+                    self.status.set(f"Capture ended (exit {code}) · {self.last_error}" if code else "Capture stopped")
             except (OSError, ValueError) as exc:
-                self.status.set(f"Cannot read capture data: {exc}")
-                self.stop()
-        self.draw_graph(self.down_graph, self.download)
-        self.draw_graph(self.up_graph, self.upload)
+                self.stop(); self.status.set(f"Cannot read capture data: {exc}")
         self.after(1000, self.tick)
 
-    def set_filter(self, category):
-        self.filter_category = category
-        self.refresh()
+    def add_packet(self, packet):
+        if not isinstance(packet, dict): return
+        src = packet.get("src") or packet.get("src_mac", "?")
+        dst = packet.get("dst") or packet.get("dst_mac", "?")
+        row = self.packet_tree.insert("", 0, values=(self.format_time(packet.get("ts", 0)), packet.get("protocol", "?"), src, dst, packet.get("length", 0)))
+        self.packet_rows[row] = packet
+        if len(self.packet_rows) > 1000:
+            oldest = self.packet_tree.get_children()[-1]
+            self.packet_rows.pop(oldest, None)
+            self.packet_tree.delete(oldest)
 
-    def draw_categories(self):
-        canvas = self.categories
-        canvas.delete("all")
-        width, height = canvas.winfo_width(), canvas.winfo_height()
-        counts = self.model.categories.most_common()
-        if not counts:
-            canvas.create_text(width / 2, height / 2, text="No websites observed yet",
-                               fill=MUTED, font=("Sans", 10))
-            return
-        total = sum(count for _, count in counts)
-        legend_width = max(self.graph_font.measure(f"{category}  100%") for category, _ in counts) + 38
-        diameter = max(30, min(width - legend_width - 28, height - 16, 300))
-        left, top = 8, max(8, (height - diameter) / 2)
-        start = 90
-        for index, (category, count) in enumerate(counts):
-            color = CATEGORY_COLORS[index % len(CATEGORY_COLORS)]
-            extent = 360 * count / total
-            if len(counts) == 1:
-                canvas.create_oval(left, top, left + diameter, top + diameter,
-                                   fill=color, outline=CARD, width=2, tags=(f"category-{index}",))
-            else:
-                canvas.create_arc(left, top, left + diameter, top + diameter, start=start,
-                                  extent=-extent, fill=color, outline=CARD, width=2,
-                                  tags=(f"category-{index}",))
-            start -= extent
-        canvas.create_oval(left + diameter * .29, top + diameter * .29,
-                           left + diameter * .71, top + diameter * .71,
-                           fill=CARD, outline=CARD)
-        center_y = top + diameter / 2
-        canvas.create_text(left + diameter / 2, center_y - 4, text=str(total), anchor="s",
-                           fill=TEXT, font=("Sans", 16, "bold"))
-        canvas.create_text(left + diameter / 2, center_y + 4, text="observations", anchor="n",
-                           fill=MUTED, font=("Sans", 8))
-        legend_x = left + diameter + 18
-        legend_spacing = self.graph_font.metrics("linespace") + 8
-        for index, (category, count) in enumerate(counts):
-            y = max(legend_spacing / 2, (height - len(counts) * legend_spacing) / 2 + legend_spacing / 2) + index * legend_spacing
-            if y > height - 8:
-                break
-            tags = (f"category-{index}",)
-            canvas.create_oval(legend_x, y - 4, legend_x + 9, y + 5,
-                               fill=CATEGORY_COLORS[index % len(CATEGORY_COLORS)], outline="", tags=tags)
-            canvas.create_text(legend_x + 16, y, anchor="w", fill=TEXT, font=self.graph_font,
-                               text=f"{category}  {count / total:.0%}", tags=tags)
+    def packet_details(self, _event):
+        selected = self.packet_tree.selection()
+        packet = self.packet_rows.get(selected[0]) if selected else None
+        if packet: self.set_details(self.packet_detail, packet_text(packet))
 
-    def category_clicked(self, event):
-        for item in self.categories.find_overlapping(event.x, event.y, event.x, event.y):
-            for tag in self.categories.gettags(item):
-                if tag.startswith("category-"):
-                    index = int(tag.removeprefix("category-"))
-                    counts = self.model.categories.most_common()
-                    if index < len(counts):
-                        self.set_filter(counts[index][0])
-                    return
-
-    def refresh(self):
-        self.category_status.set(f"Filter: {self.filter_category}  ×" if self.filter_category else "All categories")
-        self.draw_categories()
+    def refresh_websites(self):
+        selected = self.website_tree.selection()
+        selected_site = self.website_rows.get(selected[0]) if selected else None
         self.website_tree.delete(*self.website_tree.get_children())
+        self.website_rows.clear()
         for site in self.model.websites:
-            if self.filter_category and site["category"] != self.filter_category:
-                continue
-            self.website_tree.insert("", "end", values=(self.format_time(site["ts"]), site["host"], site["category"], site["ip"]))
+            row = self.website_tree.insert("", "end", values=(self.format_time(site["ts"]), site["hostname"],
+                                                               site["src"], site["protocol"]))
+            self.website_rows[row] = site
+            if site is selected_site:
+                self.website_tree.selection_set(row)
+                self.set_details(self.website_detail, website_text(site, self.model.handshakes))
+
+    def website_details(self, _event):
+        selected = self.website_tree.selection()
+        site = self.website_rows.get(selected[0]) if selected else None
+        if site:
+            self.set_details(self.website_detail, website_text(site, self.model.handshakes))
+
+    def refresh_handshakes(self):
         selected = self.handshake_tree.selection()
         selected_item = self.handshake_rows.get(selected[0]) if selected else None
-        self.handshake_tree.delete(*self.handshake_tree.get_children())
-        self.handshake_rows = {}
-        for handshake in self.model.handshakes:
-            client, server = handshake["client"], handshake["server"]
-            name = client.get("sni") if client else None
-            name = name or handshake["key"][2]
+        self.handshake_tree.delete(*self.handshake_tree.get_children()); self.handshake_rows.clear()
+        for item in self.model.handshakes:
+            client, server = item["client"], item["server"]
+            name = (client.get("sni") if client else None) or item["key"][2]
             status = "Client + server" if client and server else "Client only" if client else "Server only"
-            row = self.handshake_tree.insert("", "end", values=(self.format_time(handshake["ts"]), name, status))
-            self.handshake_rows[row] = handshake
-            if handshake is selected_item:
-                self.handshake_tree.selection_set(row)
+            row = self.handshake_tree.insert("", "end", values=(self.format_time(item["ts"]), name, status))
+            self.handshake_rows[row] = item
+            if item is selected_item: self.handshake_tree.selection_set(row)
 
     def handshake_details(self, _event):
         selected = self.handshake_tree.selection()
         item = self.handshake_rows.get(selected[0]) if selected else None
-        if not item:
-            return
-        text = handshake_text(item)
-        self.detail.configure(state="normal")
-        self.detail.delete("1.0", "end")
-        self.detail.insert("1.0", text)
-        self.detail.configure(state="disabled")
+        if item: self.set_details(self.detail, handshake_text(item))
 
     @staticmethod
     def format_time(timestamp):
-        try:
-            return time.strftime("%H:%M:%S", time.localtime(timestamp))
-        except (OSError, OverflowError, ValueError):
-            return "—"
+        try: return time.strftime("%H:%M:%S", time.localtime(timestamp))
+        except (OSError, OverflowError, TypeError, ValueError): return "—"
 
     def close(self):
         self.stop()
-        if self.reader:
-            self.reader.close()
-        if self.process is None and self.session:
-            self.session.cleanup()
-        # The helper exits on stdin EOF even if the window is closed during authorization.
+        for reader in (self.reader, self.packet_reader):
+            if reader: reader.close()
+        if self.process is None and self.session: self.session.cleanup()
         self.destroy()
 
 
