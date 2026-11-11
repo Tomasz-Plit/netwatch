@@ -83,11 +83,12 @@ class CaptureModel:
         if not isinstance(event, dict):
             return
         kind = event.get("event")
+        transport = "QUIC" if kind == "quic_hostname" or event.get("transport") == "QUIC" else "TLS"
         if kind in ("client_hello", "quic_hostname"):
             hostname, src = event.get("sni"), event.get("src")
             if isinstance(hostname, str) and hostname and isinstance(src, str) and src:
                 self.websites.appendleft({"hostname": hostname, "src": src,
-                                          "protocol": "QUIC" if kind == "quic_hostname" else "TLS",
+                                          "protocol": transport,
                                           "ts": event.get("ts", 0), "event": event})
         if kind not in ("client_hello", "server_hello"):
             return
@@ -100,12 +101,12 @@ class CaptureModel:
             ts = 0
         client = kind == "client_hello"
         key = (src, sport, dst, dport) if client else (dst, dport, src, sport)
-        match = next((item for item in self.handshakes if item["key"] == key
+        match = next((item for item in self.handshakes if item["key"] == key and item["transport"] == transport
                       and abs(ts - item["ts"]) <= 120
                       and ((client and item["client"] is None and item["server"] is not None)
                            or (not client and item["server"] is None and item["client"] is not None))), None)
         if match is None:
-            match = {"key": key, "ts": ts, "client": None, "server": None}
+            match = {"key": key, "ts": ts, "client": None, "server": None, "transport": transport}
             self.handshakes.appendleft(match)
         match["client" if client else "server"] = event
 

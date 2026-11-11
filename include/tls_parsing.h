@@ -27,6 +27,7 @@ struct tls_event {
     } data;
 };
 int server_hello(const unsigned char *p, size_t n, struct tls_server_hello *sh);
+int parse_tls_client_hello(const unsigned char *p, size_t n, struct tls_client_hello *ch);
 int extract_sni_hs(const unsigned char *p, size_t len, char *out, size_t outsz);
 int extract_sni(const unsigned char *p, size_t len, char *out, size_t outsz);
 size_t tls_feed_ip(int family, const unsigned char *src, const unsigned char *dst, uint16_t sport, uint16_t dport, uint32_t seq, const unsigned char *payload, size_t len, struct tls_event *events, size_t cap);

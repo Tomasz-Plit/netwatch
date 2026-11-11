@@ -38,7 +38,7 @@ want to keep its logs.
 lists devices that reply. Run it only on a network you are authorized to scan;
 devices that do not respond will not appear.
 
-The dashboard shows observed TLS and QUIC hostnames alongside grouped TLS
+The dashboard shows observed TLS and QUIC hostnames alongside grouped TLS and QUIC
 handshakes; the packet list is available in a separate tab. These are hostname
 observations, not a complete browsing history or confirmed page visits. Select
 a hostname to inspect its connection and available handshake details. Select
@@ -100,5 +100,6 @@ The main implementation is in `src/main.c`.
 - IPv6 capture covers packets visible on the selected interface. Discovery and spoofing use ARP and remain IPv4-only.
 
 - A scan finds responding devices on the local IPv4 subnet, not necessarily every device connected to Wi-Fi. `--all` uses only the results of its startup scan; it does not add devices later.
-- The hostname table is incomplete by design. It does not reveal URLs or encrypted page contents. Out-of-order TLS segments, unsupported QUIC versions, encrypted ClientHello, VPNs, and fragmented IPv6 traffic may not produce a hostname. QUIC ClientHello assembly tracks one connection at a time.
+- The hostname table is incomplete by design. It does not reveal URLs or encrypted page contents. Out-of-order TLS segments, unsupported QUIC versions, encrypted ClientHello, VPNs, and fragmented IPv6 traffic may not produce a hostname. QUIC assembly tracks up to 64 connections, replacing the least recently used when needed. A server hello is shown only when its packets are captured and successfully parsed.
+- Handshake details show names for common TLS versions, cipher suites, groups, and signature algorithms. Unknown values remain visible as hexadecimal codes.
 - A crash or forced termination can skip ARP and forwarding cleanup. Normal cleanup runs when you press Ctrl+C.

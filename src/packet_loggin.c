@@ -269,18 +269,21 @@ void log_packet(FILE *f, FILE *jsonf, const unsigned char *buf, ssize_t rec, uns
                     else fprintf(f, "\tQUIC client Initial decrypted: %zu bytes\n", plain_len);
                     print_payload(f, plain, plain_len);
                     if(!is_server){
-                        char host[256];
-                        int found_sni = quic_find_sni(plain, plain_len, q.dcid, q.dcid_len, host, sizeof host);
+                        struct tls_event ev = { .type = TLS_CLIENT_HELLO };
+                        int found_hello = quic_find_client_hello(plain, plain_len, q.dcid, q.dcid_len, &ev.data.client);
                         quic_client_slot(&q);
-                        if (found_sni){
-                            fprintf(f, "Website (QUIC): %s\n", host);
-                            host_seen_ip(host, family, src);
-                            hostname_json_write(jsonf, host, family, src, dst, rd16(l4), rd16(l4 + 2), &ts);
+                        if (found_hello){
+                            if (ev.data.client.sni[0]) {
+                                fprintf(f, "Website (QUIC): %s\n", ev.data.client.sni);
+                                host_seen_ip(ev.data.client.sni, family, src);
+                            }
+                            quic_json_write_ip(jsonf, &ev, family, src, dst, rd16(l4), rd16(l4 + 2), &ts);
                         }
                     } else{
-                        struct tls_server_hello hello;
-                        if(quic_find_server_hello(plain, plain_len, &q, &hello)){
-                            fprintf(f, "QUIC ServerHello: version 0x%04x, cipher 0x%04x\n", hello.version ? hello.version : hello.legacy_version, hello.cipher);
+                        struct tls_event ev = { .type = TLS_SERVER_HELLO, .direction = 1 };
+                        if(quic_find_server_hello(plain, plain_len, &q, &ev.data.server)){
+                            fprintf(f, "QUIC ServerHello: version 0x%04x, cipher 0x%04x\n", ev.data.server.version ? ev.data.server.version : ev.data.server.legacy_version, ev.data.server.cipher);
+                            quic_json_write_ip(jsonf, &ev, family, src, dst, rd16(l4), rd16(l4 + 2), &ts);
                         }
                     }
                 }

@@ -13,7 +13,7 @@ app: netwatch
 
 test: test-shutdown
 	@set -eu; dir=$$(mktemp -d); trap 'rm -rf "$$dir"' EXIT; \
-	for name in test_ipv6 test_port_filter test_tls_flow test_tls_metadata test_packet_json; do \
+	for name in test_ipv6 test_port_filter test_tls_flow test_tls_metadata test_packet_json test_quic_ack; do \
 		$(CC) $(CFLAGS) tests/$$name.c $(filter-out src/main.c,$(SOURCES)) -o "$$dir/$$name" -lcrypto; \
 		"$$dir/$$name"; \
 		echo "$$name passed"; \

@@ -2,7 +2,9 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
+#include <sys/types.h>
 #include "../include/helpers.h"
 #include "../include/tls_parsing.h"
 
@@ -10,12 +12,14 @@
 #define MAX_FLOWS 64
 
 static struct ch quic_flows[MAX_FLOWS];
+static uint64_t flow_clock;
 
 struct ch *quic_client_slot(const struct quic_initial *q){
     struct ch *slot = NULL;
     for(int i = 0; i < MAX_FLOWS; i++){
         if (quic_flows[i].active && quic_flows[i].dcid_len == q->dcid_len && memcmp(quic_flows[i].dcid, q->dcid, q->dcid_len) == 0){
             slot = &quic_flows[i];
+            slot->last_used = ++flow_clock;
             slot->scid_len = q->scid_len;
             memcpy(slot->scid, q->scid, q->scid_len);
             return slot;
@@ -27,7 +31,10 @@ struct ch *quic_client_slot(const struct quic_initial *q){
 struct ch *quic_server_slot(const struct quic_initial *q){
     if (q->dcid_len == 0 || q->dcid_len > 20) return NULL;
     for(int i = 0; i < MAX_FLOWS; i++){
-        if(quic_flows[i].active && quic_flows[i].scid_len == q->dcid_len && memcmp(quic_flows[i].scid, q->dcid, q->dcid_len) == 0) return &quic_flows[i];
+        if(quic_flows[i].active && quic_flows[i].scid_len == q->dcid_len && memcmp(quic_flows[i].scid, q->dcid, q->dcid_len) == 0) {
+            quic_flows[i].last_used = ++flow_clock;
+            return &quic_flows[i];
+        }
     }
     return NULL;
 }
@@ -43,6 +50,35 @@ static int read_variant(const unsigned char *p, size_t len, size_t *pos, uint64_
     return 1;
 }
 
+static int skip_ack(const unsigned char *pl, size_t len, size_t *pos, uint64_t type){
+    uint64_t ignored;
+    uint64_t range_count;
+
+    //      largest ackowledged
+    if (!read_variant(pl, len, pos, &ignored)) return 0;
+    //      ACK delay
+    if (!read_variant(pl, len, pos, &ignored)) return 0;
+    //      Number of additional ranges
+    if (!read_variant(pl, len, pos, &range_count)) return 0;
+    //      First ACK range
+    if (!read_variant(pl, len, pos, &ignored)) return 0;
+    if (range_count > (len - *pos) / 2) return 0;
+
+    for(uint64_t n = 0; n < range_count; n++){
+        //  gap
+        if(!read_variant(pl, len, pos, &ignored)) return 0;
+        //  ACK range len
+        if(!read_variant(pl, len, pos, &ignored)) return 0;
+    }
+
+    if(type == 0x03){
+        for(int n = 0; n < 3; n++){
+            if(!read_variant(pl, len, pos, &ignored)) return 0;
+        }
+    }
+    return 1;
+}
+
 static size_t quic_collect_crypto(const unsigned char *pl, size_t len, unsigned char *data, unsigned char *have){
 
     size_t i = 0;
@@ -50,6 +86,10 @@ static size_t quic_collect_crypto(const unsigned char *pl, size_t len, unsigned 
         uint64_t type;
         if (!read_variant(pl, len, &i, &type)) break;
         if (type == 0x00 || type == 0x01) continue;
+        if (type == 0x02 || type == 0x03){
+            if (!skip_ack(pl, len, &i, type)) break;
+            continue;
+        }
         if (type != 0x06) break;
 
         uint64_t off, clen;
@@ -223,31 +263,50 @@ int quic_find_server_hello(const unsigned char *pl, size_t len, const struct qui
     return 0;
 }
 
-int quic_find_sni(const unsigned char *pl, size_t len,
-			const unsigned char *dcid, size_t dcid_len,
-			char *out, size_t outsz) {
+int quic_find_client_hello(const unsigned char *pl, size_t len,
+                           const unsigned char *dcid, size_t dcid_len,
+                           struct tls_client_hello *out) {
     if (dcid_len > sizeof quic_flows[0].dcid) return 0;
     struct ch *slot = NULL;
     struct ch *free_slot = NULL;
+    struct ch *oldest = NULL;
     for (int i = 0; i < MAX_FLOWS; i++){
         if(quic_flows[i].active && quic_flows[i].dcid_len == dcid_len && memcmp(quic_flows[i].dcid, dcid, dcid_len) == 0){
             slot = &quic_flows[i];
             break;
         }
         if(!quic_flows[i].active) free_slot = &quic_flows[i];
+        else if (!oldest || quic_flows[i].last_used < oldest->last_used) oldest = &quic_flows[i];
     }
     if (slot == NULL){
-        if (free_slot == NULL) return 0;
-        slot = free_slot;
+        slot = free_slot ? free_slot : oldest;
+        if (!slot) return 0;
+        memset(slot, 0, sizeof *slot);
         slot->dcid_len = dcid_len;
         slot->active = 1;
         memcpy(slot->dcid, dcid, dcid_len);
     }
+    slot->last_used = ++flow_clock;
     if (slot->client_done) return 0;
     size_t prefix = quic_collect_crypto(pl, len, slot->client_data, slot->client_have);
-    if (extract_sni_hs(slot->client_data, prefix, out, outsz)) {
+    if (prefix < 4) return 0;
+    size_t body_len = ((size_t)slot->client_data[1] << 16) |
+                      ((size_t)slot->client_data[2] << 8) | slot->client_data[3];
+    size_t message_len = 4 + body_len;
+    if (message_len > prefix) return 0;
+    if (parse_tls_client_hello(slot->client_data, message_len, out)) {
         slot->client_done = 1;
         return 1;
     }
     return 0;
+}
+
+int quic_find_sni(const unsigned char *pl, size_t len,
+                  const unsigned char *dcid, size_t dcid_len,
+                  char *out, size_t outsz) {
+    struct tls_client_hello hello;
+    if (!quic_find_client_hello(pl, len, dcid, dcid_len, &hello) ||
+        !hello.sni[0] || strlen(hello.sni) >= outsz) return 0;
+    memcpy(out, hello.sni, strlen(hello.sni) + 1);
+    return 1;
 }

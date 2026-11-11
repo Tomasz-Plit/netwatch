@@ -33,6 +33,7 @@ struct ch{
     unsigned char server_have[CH_MAX];
     int server_done;
     int active;
+    uint64_t last_used;
 };
 struct tls_server_hello;
 int quic_find_server_hello(const unsigned char *pl, size_t len, const struct quic_initial *q, struct tls_server_hello *out);
@@ -48,5 +49,8 @@ int quic_decrypt_initial(const unsigned char *p, size_t len, const struct quic_i
 int quic_find_sni(const unsigned char *pl, size_t len,
 			const unsigned char *dcid, size_t dcid_len,
 			char *out, size_t outsz);
+int quic_find_client_hello(const unsigned char *pl, size_t len,
+                           const unsigned char *dcid, size_t dcid_len,
+                           struct tls_client_hello *out);
 
 #endif

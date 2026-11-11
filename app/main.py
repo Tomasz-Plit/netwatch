@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
-from tkinter import font as tkfont, messagebox, ttk
+from tkinter import font as tkfont, ttk
 
 from model import (CaptureModel, JsonLines, default_gateway, default_interface,
                    interface_address, scan_addresses, scanned_targets, spoof_addresses)
@@ -18,28 +18,52 @@ ROOT = Path(__file__).resolve().parent.parent
 BG, CARD, TEXT, MUTED, GREEN = "#101923", "#192634", "#e6edf4", "#9bafbe", "#53d3ad"
 
 
+def named_values(event, key):
+    values = event.get(key, [])
+    names = event.get(key + "_names", [])
+    if not isinstance(values, list):
+        return ""
+    if not isinstance(names, list):
+        names = []
+    return ", ".join(f"{names[i]} ({value})" if i < len(names) and names[i] else str(value)
+                     for i, value in enumerate(values))
+
+
+def named_value(event, key, default="Not available"):
+    value = event.get(key, default)
+    name = event.get(key + "_name")
+    return f"{name} ({value})" if name else str(value)
+
+
 def handshake_text(item):
     client, server = item["client"], item["server"]
     src, sport, dst, dport = item["key"]
-    lines = [f"{src}:{sport}  →  {dst}:{dport}", ""]
+    lines = [f"Transport: {item.get('transport', 'TLS')}", f"{src}:{sport}  →  {dst}:{dport}", ""]
     if client:
         lines += ["CLIENT HELLO", f"  Hostname: {client.get('sni') or 'Not available'}"]
         for key, label in (("versions", "Supported versions"), ("alpn", "Protocols")):
             if client.get(key):
-                lines.append(f"  {label}: {', '.join(map(str, client[key]))}")
+                lines.append(f"  {label}: {named_values(client, key)}")
     else:
         lines.append("CLIENT HELLO  ·  Not captured")
     lines.append("")
     if server:
-        lines += ["SERVER HELLO", f"  TLS version: {server.get('version', 'Not available')}",
-                  f"  Selected cipher: {server.get('cipher', 'Not available')}"]
+        lines += ["SERVER HELLO", f"  TLS version: {named_value(server, 'version')}",
+                  f"  Selected cipher: {named_value(server, 'cipher')}"]
+        if server.get("key_share_group"):
+            lines.append(f"  Selected key-share group: {named_value(server, 'key_share_group')}")
     else:
         lines.append("SERVER HELLO  ·  Not captured")
     if client:
         for key, label in (("ciphers", "Offered ciphers"), ("groups", "Groups"),
                            ("sig_algs", "Signature algorithms"), ("key_shares", "Key shares")):
             if client.get(key):
-                lines += ["", f"{label}: {', '.join(map(str, client[key]))}"]
+                lines += ["", f"{label}: {named_values(client, key)}"]
+    lines += ["", "ABOUT THESE FIELDS",
+              "Cipher suite: algorithms used to protect the connection.",
+              "Groups and key shares: methods used to establish shared keys.",
+              "Signature algorithms: methods supported for digital signatures.",
+              "Client values are offers; server values show what was selected."]
     return "\n".join(lines)
 
 
@@ -73,14 +97,13 @@ def website_text(site, handshakes):
         lines.append(f"Source port: {event['sport']}")
     if event.get("dport") is not None:
         lines.append(f"Destination port: {event['dport']}")
-    if site["protocol"] == "TLS":
-        handshake = next((item for item in handshakes if item["client"] is event), None)
-        if handshake:
-            lines += ["", handshake_text(handshake)]
-        else:
-            lines += ["", "The matching handshake is no longer in the recent handshake list."]
-    else:
+    handshake = next((item for item in handshakes if item["client"] is event), None)
+    if handshake:
+        lines += ["", handshake_text(handshake)]
+    elif event.get("event") == "quic_hostname":
         lines += ["", "Hostname found in a QUIC Initial handshake."]
+    else:
+        lines += ["", "The matching handshake is no longer in the recent handshake list."]
     return "\n".join(lines)
 
 
@@ -185,8 +208,8 @@ class Dashboard(tk.Tk):
         self.packet_tree.column("length", width=90, minwidth=75, stretch=False)
         self.packet_tree.bind("<<TreeviewSelect>>", self.packet_details)
         self.packet_detail = self.details(packet_tab, "Select a packet to inspect its fields.")
-        tk.Label(handshakes, text="Recent TLS handshakes · client and server messages grouped", bg=CARD, fg=TEXT, anchor="w").pack(fill="x", pady=(0, 6))
-        self.handshake_tree = self.tree(handshakes, ("time", "website", "status"), ("Time", "Hostname / server", "Messages"))
+        tk.Label(handshakes, text="Recent TLS and QUIC handshakes · messages grouped", bg=CARD, fg=TEXT, anchor="w").pack(fill="x", pady=(0, 6))
+        self.handshake_tree = self.tree(handshakes, ("time", "website", "transport", "status"), ("Time", "Hostname / server", "Protocol", "Messages"))
         self.handshake_tree.column("time", width=self.time_width, minwidth=self.time_width, stretch=False)
         self.handshake_tree.bind("<<TreeviewSelect>>", self.handshake_details)
         self.detail = self.details(handshakes, "Select a handshake to inspect its fields.")
@@ -224,6 +247,27 @@ class Dashboard(tk.Tk):
         widget.insert("1.0", value)
         widget.configure(state="disabled")
 
+    def show_error(self, title, message, parent=None):
+        parent = parent if parent and parent.winfo_exists() else self
+        window = tk.Toplevel(parent)
+        window.title(title)
+        width = min(700, window.winfo_screenwidth())
+        height = min(360, window.winfo_screenheight())
+        x = (window.winfo_screenwidth() - width) // 2
+        y = (window.winfo_screenheight() - height) // 2
+        window.geometry(f"{width}x{height}+{x}+{y}")
+        window.transient(parent)
+        window.configure(bg=BG)
+        frame = tk.Frame(window, bg=BG, padx=24, pady=20)
+        frame.pack(fill="both", expand=True)
+        tk.Label(frame, text=title, bg=BG, fg=TEXT, font=("Sans", 16, "bold"),
+                 anchor="w").pack(fill="x", pady=(0, 12))
+        details = self.details(frame, message)
+        details.configure(font=("Sans", 11))
+        tk.Button(frame, text="Close", command=window.destroy, bg=GREEN, fg="#10211d",
+                  relief="flat", padx=20, pady=6).pack(anchor="e", pady=(14, 0))
+        window.grab_set()
+
     def start(self):
         if self.process is not None:
             return
@@ -259,6 +303,7 @@ class Dashboard(tk.Tk):
             self.set_details(self.packet_detail, "Select a packet to inspect its fields.")
             self.set_details(self.detail, "Select a handshake to inspect its fields.")
             self.last_error = "authorization cancelled or capture failed"
+            self.capture_error_reported = False
             self.spoof_ready = False
             self.capture_spoof = bool(spoof)
             self.process = subprocess.Popen(["pkexec", sys.executable, str(ROOT / "app/capture_helper.py"), str(ROOT / "netwatch"), self.session.name, *spoof],
@@ -271,7 +316,7 @@ class Dashboard(tk.Tk):
             self.spoof_toggle.configure(state="disabled")
             self.update_spoof_controls()
         except (OSError, ValueError) as exc:
-            messagebox.showerror("Cannot start capture", str(exc))
+            self.show_error("Cannot start capture", str(exc))
 
     def read_errors(self, process):
         for line in process.stderr:
@@ -292,7 +337,7 @@ class Dashboard(tk.Tk):
             gateway = default_gateway(default_interface())
         except (OSError, ValueError) as exc:
             if not silent:
-                messagebox.showerror("Cannot detect gateway", str(exc))
+                self.show_error("Cannot detect gateway", str(exc))
             return
         self.gateway_entry.delete(0, "end")
         self.gateway_entry.insert(0, gateway)
@@ -334,7 +379,9 @@ class Dashboard(tk.Tk):
                 router = None
             process = subprocess.Popen(["pkexec", str(ROOT / "netwatch"), "--scan"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except (OSError, ValueError) as exc:
-            self.scan_status.set(f"Could not start scan: {exc}"); return
+            self.scan_status.set(f"Could not start scan: {exc}")
+            self.show_error("Cannot start scan", str(exc), self.discovery_window)
+            return
         self.scanning = True
         self.scanned_addresses = []
         self.scanned_interface = None
@@ -355,9 +402,12 @@ class Dashboard(tk.Tk):
                 self.scanned_addresses = scan_addresses(output)
                 self.scanned_interface = interface
                 self.scanned_own, self.scanned_gateway = own_ip, router
+            else:
+                reason = error.strip() or "Authorization cancelled or scan failed."
+                self.show_error("Network scan failed", reason, getattr(self, "discovery_window", None))
             if getattr(self, "discovery_window", None) and self.discovery_window.winfo_exists():
                 if code:
-                    self.scan_status.set(f"Scan failed: {error.strip() or 'authorization cancelled or scan failed'}")
+                    self.scan_status.set(f"Scan failed: {reason}")
                 else:
                     addresses = self.scanned_addresses
                     for address in addresses: self.scan_tree.insert("", "end", values=(address,))
@@ -390,8 +440,13 @@ class Dashboard(tk.Tk):
                     self.spoof_toggle.configure(state="normal")
                     self.update_spoof_controls()
                     self.status.set(f"Capture ended (exit {code}) · {self.last_error}" if code else "Capture stopped")
+                    if code and not self.capture_error_reported:
+                        self.show_error("Capture stopped unexpectedly", f"Exit code: {code}\n\n{self.last_error}")
             except (OSError, ValueError) as exc:
                 self.stop(); self.status.set(f"Cannot read capture data: {exc}")
+                if not self.capture_error_reported:
+                    self.capture_error_reported = True
+                    self.show_error("Cannot read capture data", str(exc))
         self.after(1000, self.tick)
 
     def add_packet(self, packet):
@@ -436,8 +491,8 @@ class Dashboard(tk.Tk):
         for item in self.model.handshakes:
             client, server = item["client"], item["server"]
             name = (client.get("sni") if client else None) or item["key"][2]
-            status = "Client + server" if client and server else "Client only" if client else "Server only"
-            row = self.handshake_tree.insert("", "end", values=(self.format_time(item["ts"]), name, status))
+            status = "Client + server" if client and server else "Server not observed" if client else "Client not observed"
+            row = self.handshake_tree.insert("", "end", values=(self.format_time(item["ts"]), name, item["transport"], status))
             self.handshake_rows[row] = item
             if item is selected_item: self.handshake_tree.selection_set(row)
 

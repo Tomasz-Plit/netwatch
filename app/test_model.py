@@ -13,6 +13,22 @@ from main import handshake_text, packet_text, website_text
 
 
 class ModelTests(unittest.TestCase):
+    def test_quic_handshakes_are_displayed_and_separate_from_tcp(self):
+        model = CaptureModel()
+        client = {"event": "client_hello", "transport": "QUIC", "src": "192.0.2.1", "dst": "192.0.2.2",
+                  "sport": 1234, "dport": 443, "sni": "example.com", "ts": 1, "alpn": ["h3"]}
+        server = {"event": "server_hello", "transport": "QUIC", "src": "192.0.2.2", "dst": "192.0.2.1",
+                  "sport": 443, "dport": 1234, "cipher": "0x1301", "ts": 2}
+        model.add(client)
+        model.add({**server, "transport": "TLS"})
+        self.assertEqual(len(model.handshakes), 2)
+        model.add(server)
+        quic = next(item for item in model.handshakes if item["transport"] == "QUIC")
+        self.assertIs(quic["server"], server)
+        self.assertEqual(model.websites[0]["protocol"], "QUIC")
+        self.assertIn("Protocols: h3", website_text(model.websites[0], model.handshakes))
+        self.assertIn("Selected cipher: 0x1301", website_text(model.websites[0], model.handshakes))
+
     def test_websites_from_c_tls_and_quic_events(self):
         model = CaptureModel()
         model.add({"event": "client_hello", "src": "192.0.2.1", "dst": "192.0.2.2",
@@ -65,6 +81,19 @@ class ModelTests(unittest.TestCase):
         self.assertIn("Selected cipher: 0x1301", text)
         item["server"] = None
         self.assertIn("SERVER HELLO  ·  Not captured", handshake_text(item))
+
+    def test_handshake_details_show_names_and_keep_unknown_codes(self):
+        item = {"key": ("a", 1234, "b", 443),
+                "client": {"ciphers": ["0x1301", "0xffff"],
+                           "ciphers_names": ["TLS_AES_128_GCM_SHA256", None],
+                           "groups": ["0x001d"], "groups_names": ["x25519"]},
+                "server": {"version": "0x0304", "version_name": "TLS 1.3",
+                           "cipher": "0x1301", "cipher_name": "TLS_AES_128_GCM_SHA256"}}
+        details = handshake_text(item)
+        self.assertIn("TLS_AES_128_GCM_SHA256 (0x1301)", details)
+        self.assertIn("0xffff", details)
+        self.assertIn("x25519 (0x001d)", details)
+        self.assertIn("TLS 1.3 (0x0304)", details)
 
     def test_handshake_pairing_and_reused_port(self):
         model = CaptureModel()

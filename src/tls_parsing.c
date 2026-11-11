@@ -34,7 +34,7 @@ static int list16(const unsigned char *p, size_t n, uint16_t *out, size_t cap, s
     return 1;
 }
 
-static int client_hello(const unsigned char *p, size_t n, struct tls_client_hello *ch) {
+int parse_tls_client_hello(const unsigned char *p, size_t n, struct tls_client_hello *ch) {
     if (n < 4 + 2 + 32 + 1 || p[0] != 1 ||
         (((size_t)p[1] << 16) | ((size_t)p[2] << 8) | p[3]) != n - 4) return 0;
     memset(ch, 0, sizeof *ch);
@@ -109,7 +109,7 @@ static int client_hello(const unsigned char *p, size_t n, struct tls_client_hell
 
 int extract_sni_hs(const unsigned char *p, size_t n, char *out, size_t cap) {
     struct tls_client_hello ch;
-    if (!client_hello(p, n, &ch) || !ch.sni[0] || strlen(ch.sni) >= cap) return 0;
+    if (!parse_tls_client_hello(p, n, &ch) || !ch.sni[0] || strlen(ch.sni) >= cap) return 0;
     strcpy(out, ch.sni);
     return 1;
 }
@@ -180,7 +180,7 @@ static size_t pending_hello(struct stream *s, int direction,
         struct tls_event *ev = &events[count];
         memset(ev, 0, sizeof *ev);
         ev->direction = direction;
-        if (s->handshake[0] == 1 && client_hello(s->handshake, msg + 4, &ev->data.client))
+        if (s->handshake[0] == 1 && parse_tls_client_hello(s->handshake, msg + 4, &ev->data.client))
             ev->type = TLS_CLIENT_HELLO, count++;
         else if (s->handshake[0] == 2 && server_hello(s->handshake, msg + 4, &ev->data.server))
             ev->type = TLS_SERVER_HELLO, count++;
