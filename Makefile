@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -Wall -Wextra -Wpedantic -O2
 
 SOURCES = src/main.c src/arp_parsing.c src/helpers.c src/packet_loggin.c \
-	src/quic_parsing.c src/statistic.c src/tls_parsing.c src/port_lock.c src/tcp_track.c src/tls_json.c
+	src/quic_parsing.c src/statistic.c src/tls_parsing.c src/port_lock.c src/tcp_track.c src/tls_json.c src/packet_json.c
 
 netwatch: $(SOURCES) $(wildcard include/*.h)
 	$(CC) $(CFLAGS) $(SOURCES) -o $@ -lcrypto
@@ -13,7 +13,7 @@ app: netwatch
 
 test: test-shutdown
 	@set -eu; dir=$$(mktemp -d); trap 'rm -rf "$$dir"' EXIT; \
-	for name in test_ipv6 test_port_filter test_tls_flow test_tls_metadata; do \
+	for name in test_ipv6 test_port_filter test_tls_flow test_tls_metadata test_packet_json; do \
 		$(CC) $(CFLAGS) tests/$$name.c $(filter-out src/main.c,$(SOURCES)) -o "$$dir/$$name" -lcrypto; \
 		"$$dir/$$name"; \
 		echo "$$name passed"; \

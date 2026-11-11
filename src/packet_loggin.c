@@ -257,6 +257,7 @@ void log_packet(FILE *f, FILE *jsonf, const unsigned char *buf, ssize_t rec, uns
                     if (quic_find_sni(plain, plain_len, q.dcid, q.dcid_len, host, sizeof host)){
                         fprintf(f, "Website (QUIC): %s\n", host);
                         host_seen_ip(host, family, src);
+                        hostname_json_write(jsonf, host, family, src, dst, rd16(l4), rd16(l4 + 2), &ts);
                     }
                 }
                 else {

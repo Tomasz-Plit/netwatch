@@ -80,6 +80,30 @@ static void check_run(int should_fail) {
     assert(saw_expected);
 }
 
+static void check_spoof_packet_option(void) {
+    int output[2];
+    assert(pipe(output) == 0);
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        close(output[0]);
+        assert(dup2(output[1], STDERR_FILENO) >= 0);
+        close(output[1]);
+        char *args[] = { "netwatch", "--packet-json", "--spoof", "invalid", "192.0.2.1", NULL };
+        exit(netwatch_main(5, args));
+    }
+    close(output[1]);
+    FILE *log = fdopen(output[0], "r");
+    assert(log);
+    char line[256];
+    assert(fgets(line, sizeof line, log));
+    assert(strstr(line, "bad target IP"));
+    fclose(log);
+    int status;
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 1);
+}
+
 int main(void) {
     alarm(10);
     char directory[] = "/tmp/netwatch-shutdown-XXXXXX";
@@ -87,6 +111,7 @@ int main(void) {
     assert(chdir(directory) == 0);
     check_run(0);
     check_run(1);
+    check_spoof_packet_option();
     unlink("netwatch.log");
     unlink("netwatch_tls.jsonl");
     assert(chdir("/") == 0);

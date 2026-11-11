@@ -15,6 +15,17 @@ static void list(FILE *f, const char *name, const uint16_t *items, size_t n) {
     for (size_t i = 0; i < n; i++) fprintf(f, "%s\"0x%04x\"", i ? "," : "", items[i]);
     fputc(']', f);
 }
+void hostname_json_write(FILE *f, const char *hostname, int family,
+                         const unsigned char *src, const unsigned char *dst,
+                         uint16_t sport, uint16_t dport, const struct timespec *ts) {
+    if (!f || !hostname || !*hostname) return;
+    char source[INET6_ADDRSTRLEN], destination[INET6_ADDRSTRLEN];
+    if (!inet_ntop(family, src, source, sizeof source) || !inet_ntop(family, dst, destination, sizeof destination)) return;
+    fprintf(f, "{\"event\":\"quic_hostname\",\"ts\":%lld.%09ld,\"src\":\"%s\",\"dst\":\"%s\",\"sport\":%u,\"dport\":%u,\"sni\":",
+            (long long)ts->tv_sec, ts->tv_nsec, source, destination, sport, dport);
+    string(f, hostname);
+    fputs("}\n", f);
+}
 void tls_json_write_ip(FILE *f, const struct tls_event *ev, int family,
                     const unsigned char *src, const unsigned char *dst,
                     uint16_t sport, uint16_t dport, const struct timespec *ts,

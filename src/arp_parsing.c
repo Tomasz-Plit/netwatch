@@ -123,7 +123,8 @@ int arp_resolve(int sockfd, int ifindex,
     for (int tries = 0; tries < 50; tries++) {
         ssize_t n = recvfrom(sockfd, buf, sizeof buf, 0, NULL, NULL);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR && running) continue;
+            if (errno == EINTR) return 0;
             if (errno != EAGAIN && errno != EWOULDBLOCK) perror("recvfrom (arp_resolve)");
             break;
         }

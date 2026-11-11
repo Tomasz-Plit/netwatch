@@ -1,6 +1,7 @@
 #include "../include/tls_parsing.h"
 #include "../include/tls_json.h"
 #include <assert.h>
+#include <arpa/inet.h>
 #include <string.h>
 
 int main(void) {
@@ -40,6 +41,14 @@ int main(void) {
     rewind(f);
     char line[512]; assert(fgets(line, sizeof line, f));
     assert(strstr(line, "\"direction_bytes\":2"));
+    fclose(f);
+    f = tmpfile(); assert(f);
+    hostname_json_write(f, "ex\\\"ample.com", AF_INET, a, b, 12345, 443, &ts);
+    rewind(f); memset(line, 0, sizeof line); assert(fgets(line, sizeof line, f));
+    assert(strstr(line, "\"event\":\"quic_hostname\""));
+    assert(strstr(line, "\"src\":\"1.2.3.4\""));
+    assert(strstr(line, "\"dst\":\"5.6.7.8\",\"sport\":12345,\"dport\":443"));
+    assert(strstr(line, "ex\\\\\\\"ample.com"));
     fclose(f);
     unsigned char alert[] = {21, 3, 3, 0, 2, 2, 40};
     assert(tls_feed(b, a, 443, 50000, 213, alert, sizeof alert, ev, 4) == 1);

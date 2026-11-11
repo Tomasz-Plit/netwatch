@@ -17,6 +17,7 @@
 #include "../include/port_lock.h"
 #include "../include/statistic.h"
 #include "../include/helpers.h"
+#include "../include/packet_json.h"
 
 //#define IFNAME "wlp0s20f3"
 #define MAX_SCAN_HOSTS 4096
@@ -26,6 +27,7 @@ int main(int argc, char *argv[]) {
     int do_spoof = 0;
     int do_discover = 0;
     int do_all = 0;
+    int packet_json = 0;
     unsigned port_filter = 0;
     const char *target_ip_strs[MAX_SPOOF_TARGETS];
     const char *gateway_ip_str = NULL;
@@ -44,7 +46,9 @@ int main(int argc, char *argv[]) {
     }
     printf("Detected interface: %s\n", ifname);
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-all") == 0 || strcmp(argv[i], "--all") == 0) {
+        if (strcmp(argv[i], "--packet-json") == 0) {
+            packet_json = 1;
+        } else if (strcmp(argv[i], "-all") == 0 || strcmp(argv[i], "--all") == 0) {
             do_all = 1;
         } else if (strcmp(argv[i], "--scan") == 0) {
             do_discover = 1;
@@ -91,6 +95,10 @@ int main(int argc, char *argv[]) {
     }
     if (port_filter && (do_all || do_spoof || do_discover)) {
         fprintf(stderr, "--restrict-port cannot be combined with scan or spoof modes\n");
+        return 1;
+    }
+    if (packet_json && (do_all || do_discover || port_filter)) {
+        fprintf(stderr, "--packet-json supports ordinary capture or --spoof only\n");
         return 1;
     }
 
@@ -196,6 +204,12 @@ int main(int argc, char *argv[]) {
     FILE *jsonfile = fopen("netwatch_tls.jsonl", "w");
     if (!jsonfile) { perror("fopen tls jsonl"); fclose(logfile); close(sockfd); return 1; }
     setvbuf(jsonfile, NULL, _IOLBF, 0);
+    FILE *packets = NULL;
+    if (packet_json) {
+        packets = fopen("netwatch_packets.jsonl", "w");
+        if (!packets) { perror("fopen packet jsonl"); fclose(jsonfile); fclose(logfile); close(sockfd); return 1; }
+        setvbuf(packets, NULL, _IOLBF, 0);
+    }
     int port_control = -1;
     pid_t port_watcher = -1;
     if (port_filter && !port_lock_start(port_filter, &port_control, &port_watcher)) {
@@ -235,6 +249,7 @@ int main(int argc, char *argv[]) {
                 gateway_mac[3], gateway_mac[4], gateway_mac[5]);
 
         for (size_t i = 0; i < spoof_count; i++) {
+            if (!running) return 0;
             struct arp_spoof_ctx *ctx = &spoof_ctx[i];
             ctx->sockfd = arp_sockfd;
             memcpy(ctx->our_mac, our_mac, sizeof our_mac);
@@ -257,15 +272,18 @@ int main(int argc, char *argv[]) {
                     ctx->target_mac[5]);
         }
 
+        if (!running) return 0;
         // Enable IP forwarding so we don't black-hole traffic
         if (!get_ip_forward(&original_ip_forward)) return 1;
         forwarding_state_saved = 1;
         if (!original_ip_forward && !set_ip_forward(1)) return 1;
 
-        for (size_t i = 0; i < spoof_count; i++) spoof_ctx[i].active = 1;
-        for (size_t i = 0; i < spoof_count; i++) arp_spoof_tick(&spoof_ctx[i], ifindex);
-        fprintf(stderr, "[arp] spoofing %zu target(s) — press Ctrl+C to stop and restore\n\n",
-                spoof_count);
+        if (running) {
+            for (size_t i = 0; i < spoof_count; i++) spoof_ctx[i].active = 1;
+            for (size_t i = 0; i < spoof_count; i++) arp_spoof_tick(&spoof_ctx[i], ifindex);
+            fprintf(stderr, "[arp] spoofing %zu target(s) — press Ctrl+C to stop and restore\n\n",
+                    spoof_count);
+        }
     }
 
     unsigned char buffer[65535];
@@ -279,7 +297,10 @@ int main(int argc, char *argv[]) {
             capture_failed = 1;
             break;
         }
-        if (rec > 0) log_packet(logfile, jsonfile, buffer, rec, port_filter);
+        if (rec > 0) {
+            if (packets) packet_json_write(packets, buffer, (size_t)rec);
+            log_packet(logfile, jsonfile, buffer, rec, port_filter);
+        }
 
         time_t now = time(NULL);
         if (now - last_print > 10) { stats_print(stdout); last_print = now; }
@@ -297,6 +318,7 @@ int main(int argc, char *argv[]) {
         close(arp_sockfd);
     }
 
+    if (packets) fclose(packets);
     fclose(jsonfile);
     fclose(logfile);
     close(sockfd);
